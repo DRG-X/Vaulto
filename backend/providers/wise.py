@@ -1,15 +1,50 @@
-import re
+"""
+WiseProvider — Wise's public comparison gateway.
+
+Endpoint: GET https://wise.com/gateway/v3/comparisons
+
+What changed and why
+--------------------
+* Numbers are decoded with `parse_float=Decimal`, so Wise's published rate
+  arrives with the digits Wise actually sent instead of the nearest binary
+  float.
+
+* We no longer take `quotes[0]`. That array holds one entry per
+  pay-in/pay-out combination, in no guaranteed order, so the old code compared
+  whichever combination happened to be first — sometimes a card-funded quote
+  against a rival's bank-funded one. Every combination is now returned as an
+  option and the engine picks the one that fits the user's filter.
+
+* Wise's fee is DEDUCTED from the amount you send: you hand over `sendAmount`,
+  Wise takes `fee` out of it and converts the rest. Declaring that lets the
+  engine stop comparing it against fee-on-top providers as if the two meant
+  the same thing.
+
+* Wise quotes at the mid-market rate, and the payload carries it explicitly.
+  That is the reference every other provider's markup is measured against, so
+  we surface it rather than throwing it away.
+"""
+
+from __future__ import annotations
+
+import logging
+from decimal import Decimal
+from typing import List, Optional
+
 import httpx
-from providers.base import BaseProvider
-from schemas import ProviderQuote
+
+import delivery
+from money import D, ZERO
+from providers.base import BaseProvider, decode_json_exact
+from providers.quote import FeeModel, RawQuote
+
+logger = logging.getLogger(__name__)
 
 
 class WiseProvider(BaseProvider):
     name = "Wise"
 
-    # Public Wise comparison endpoint — no auth required
     COMPARISONS_URL = "https://wise.com/gateway/v3/comparisons"
-    # Fallback: live mid-market rate
     LIVE_RATE_URL = "https://wise.com/rates/live"
 
     HEADERS = {
@@ -21,157 +56,190 @@ class WiseProvider(BaseProvider):
         "Accept": "application/json",
     }
 
-    async def fetch_quote(
-        self, amount: float, currency_from: str, currency_to: str
-    ) -> ProviderQuote:
+    #: Pay-in methods, cheapest/most comparable first. A bank-funded transfer
+    #: is the like-for-like basis every comparison site uses as its default;
+    #: card funding carries an acquiring fee that is not really an FX cost.
+    PAY_IN_PREFERENCE = ["BANK_TRANSFER", "DIRECT_DEBIT", "SWIFT", "DEBIT_CARD", "CREDIT_CARD"]
+
+    async def fetch_raw_quote(
+        self, amount: Decimal, currency_from: str, currency_to: str
+    ) -> RawQuote:
         async with httpx.AsyncClient(timeout=15, headers=self.HEADERS) as client:
             try:
-                return await self._fetch_from_comparisons(
-                    client, amount, currency_from, currency_to
-                )
-            except Exception as e:
-                # If the comparisons endpoint fails, fall back to live rate
+                return await self._from_comparisons(client, amount, currency_from, currency_to)
+            except Exception as primary_err:
+                logger.warning("[Wise] comparisons failed (%s) — trying live rate", primary_err)
                 try:
-                    return await self._fetch_from_live_rate(
-                        client, amount, currency_from, currency_to
-                    )
+                    return await self._from_live_rate(client, amount, currency_from, currency_to)
                 except Exception as fallback_err:
-                    return self._make_quote(
-                        provider=self.name,
-                        send_amount=amount,
-                        fee=0.0,
-                        exchange_rate=0.0,
-                        receive_amount=0.0,
-                        currency_from=currency_from,
-                        currency_to=currency_to,
-                        transfer_time="Unknown",
-                        error=f"Primary: {e} | Fallback: {fallback_err}",
+                    return self._error(
+                        currency_from, currency_to,
+                        f"Primary: {primary_err} | Fallback: {fallback_err}",
                     )
 
     # ------------------------------------------------------------------ #
-    #  Primary: /gateway/v3/comparisons  (real fee + rate + ETA)
+    #  Primary: /gateway/v3/comparisons
     # ------------------------------------------------------------------ #
-    async def _fetch_from_comparisons(
+
+    async def _from_comparisons(
         self,
         client: httpx.AsyncClient,
-        amount: float,
+        amount: Decimal,
         currency_from: str,
         currency_to: str,
-    ) -> ProviderQuote:
+    ) -> RawQuote:
         resp = await client.get(
             self.COMPARISONS_URL,
             params={
-                "sourceCurrency": currency_from,
-                "targetCurrency": currency_to,
-                "sendAmount": amount,
+                "sourceCurrency": currency_from.upper(),
+                "targetCurrency": currency_to.upper(),
+                "sendAmount": str(amount),   # str keeps 1000.50 from becoming 1000.5000000001
             },
         )
         resp.raise_for_status()
-        data = resp.json()
+        data = decode_json_exact(resp)
 
-        # Find the Wise entry among providers
-        wise_provider = None
-        for provider in data.get("providers", []):
-            if provider.get("alias") == "wise":
-                wise_provider = provider
-                break
+        mid_rate = self._extract_mid_market(data)
 
-        if not wise_provider or not wise_provider.get("quotes"):
-            raise ValueError("Wise provider data not found in comparisons response")
-
-        quote = wise_provider["quotes"][0]
-
-        rate = quote.get("rate", 0.0)
-        fee = quote.get("fee", 0.0)
-        receive_amount = quote.get("receivedAmount", 0.0)
-        transfer_time = self._parse_delivery(quote.get("deliveryEstimation", {}))
-
-        return self._make_quote(
-            provider=self.name,
-            send_amount=amount,
-            fee=fee,
-            exchange_rate=rate,
-            receive_amount=receive_amount,
-            currency_from=currency_from,
-            currency_to=currency_to,
-            transfer_time=transfer_time,
+        wise_entry = next(
+            (p for p in data.get("providers", []) if str(p.get("alias", "")).lower() == "wise"),
+            None,
         )
+        if not wise_entry or not wise_entry.get("quotes"):
+            raise ValueError("Wise entry absent from comparisons response")
 
-    # ------------------------------------------------------------------ #
-    #  Fallback: /rates/live  (mid-market rate only, estimate fee)
-    # ------------------------------------------------------------------ #
-    async def _fetch_from_live_rate(
+        options: List[RawQuote] = []
+        for q in wise_entry["quotes"]:
+            option = self._build_option(q, amount, currency_from, currency_to, mid_rate)
+            if option is not None:
+                options.append(option)
+
+        if not options:
+            raise ValueError("Wise returned no usable quote rows")
+
+        options.sort(key=self._preference_key)
+
+        primary = options[0]
+        primary.options = options
+        return primary
+
+    def _build_option(
         self,
-        client: httpx.AsyncClient,
-        amount: float,
+        q: dict,
+        amount: Decimal,
         currency_from: str,
         currency_to: str,
-    ) -> ProviderQuote:
+        mid_rate: Optional[Decimal],
+    ) -> Optional[RawQuote]:
+        rate = D(q.get("rate"))
+        if rate <= ZERO:
+            return None
+
+        fee = D(q.get("fee"))
+        received = D(q.get("receivedAmount"), default=None)
+
+        eta_min, eta_max = delivery.parse_wise_estimation(q.get("deliveryEstimation") or {})
+
+        # Wise deducts its fee from the amount handed over, so the converted
+        # principal is what is left of `amount` after the fee.
+        principal = amount - fee
+
+        return RawQuote(
+            provider=self.name,
+            currency_from=currency_from.upper(),
+            currency_to=currency_to.upper(),
+            principal=principal,
+            fee=fee,
+            fee_model=FeeModel.DEDUCTED,
+            exchange_rate=rate,
+            receive_amount=received if received and received > ZERO else None,
+            eta_min_minutes=eta_min,
+            eta_max_minutes=eta_max,
+            eta_is_business_days=False,
+            pay_in_method=_upper(q.get("sourcePaymentMethod")),
+            pay_out_method=_upper(q.get("targetPaymentMethod")),
+            mid_market_rate=mid_rate,
+            rate_type="base",
+        )
+
+    def _preference_key(self, option: RawQuote):
+        """Bank-funded first, then cheapest fee — the like-for-like default."""
+        method = option.pay_in_method or ""
+        try:
+            rank = self.PAY_IN_PREFERENCE.index(method)
+        except ValueError:
+            rank = len(self.PAY_IN_PREFERENCE)
+        return (rank, option.fee, option.provider)
+
+    @staticmethod
+    def _extract_mid_market(data: dict) -> Optional[Decimal]:
+        """
+        Pull the mid-market rate out of the comparisons payload.
+
+        Wise has moved this key around across revisions, so we check the
+        shapes it has used rather than betting on one. If none is present we
+        return None and the engine simply does not report markup — a wrong
+        reference is worse than no reference, because it would misstate every
+        provider's true cost.
+        """
+        for key in ("midMarketRate", "midRate", "sourceTargetMidMarketRate"):
+            value = D(data.get(key), default=None)
+            if value and value > ZERO:
+                return value
+
+        nested = data.get("rate")
+        if isinstance(nested, dict):
+            value = D(nested.get("value") or nested.get("midMarketRate"), default=None)
+            if value and value > ZERO:
+                return value
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  Fallback: /rates/live — mid-market rate only
+    # ------------------------------------------------------------------ #
+
+    async def _from_live_rate(
+        self,
+        client: httpx.AsyncClient,
+        amount: Decimal,
+        currency_from: str,
+        currency_to: str,
+    ) -> RawQuote:
+        """
+        Last resort when the comparison gateway is unreachable.
+
+        This endpoint gives the mid-market rate and nothing else, so the fee
+        is an ESTIMATE. It is flagged as such in `rate_type` and the ETA is
+        left unknown rather than guessed — an invented delivery time would
+        silently win a "fastest" ranking it has no claim to.
+        """
         resp = await client.get(
             self.LIVE_RATE_URL,
-            params={"source": currency_from, "target": currency_to},
+            params={"source": currency_from.upper(), "target": currency_to.upper()},
         )
         resp.raise_for_status()
-        data = resp.json()
+        data = decode_json_exact(resp)
 
-        rate = data["value"]
-        # Wise typically charges ~0.5-1.5% variable fee; use a conservative estimate
-        estimated_fee_pct = 0.0065  # 0.65% of send amount
-        fee = round(amount * estimated_fee_pct, 2)
-        receive_amount = round((amount - fee) * rate, 2)
+        rate = D(data.get("value"))
+        if rate <= ZERO:
+            raise ValueError("live rate endpoint returned no usable rate")
 
-        return self._make_quote(
+        # Wise's published pricing for major corridors sits near 0.65%.
+        estimated_fee = amount * Decimal("0.0065")
+
+        return RawQuote(
             provider=self.name,
-            send_amount=amount,
-            fee=fee,
+            currency_from=currency_from.upper(),
+            currency_to=currency_to.upper(),
+            principal=amount - estimated_fee,
+            fee=estimated_fee,
+            fee_model=FeeModel.DEDUCTED,
             exchange_rate=rate,
-            receive_amount=receive_amount,
-            currency_from=currency_from,
-            currency_to=currency_to,
-            transfer_time="Within 24 hours (estimated)",
+            receive_amount=None,          # let the engine derive it
+            mid_market_rate=rate,         # Wise quotes at mid-market
+            rate_type="estimated",
         )
 
-    # ------------------------------------------------------------------ #
-    #  Helpers
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _parse_delivery(estimation: dict) -> str:
-        """Convert Wise's ISO-8601 duration or delivery date into a readable string."""
-        if not estimation:
-            return "Unknown"
 
-        # Try duration first  (e.g. "PT1H22M28S")
-        duration = estimation.get("duration")
-        if duration and duration.get("min"):
-            raw = duration["min"]  # e.g. "PT1H22M28.893687513S"
-            return WiseProvider._iso_duration_to_human(raw)
-
-        # Fall back to delivery date
-        delivery_date = estimation.get("deliveryDate")
-        if delivery_date and delivery_date.get("min"):
-            # Just return the date portion
-            dt_str = delivery_date["min"]  # ISO datetime string
-            date_part = dt_str.split("T")[0] if "T" in dt_str else dt_str
-            return f"By {date_part}"
-
-        return "Unknown"
-
-    @staticmethod
-    def _iso_duration_to_human(iso: str) -> str:
-        """Convert 'PT1H22M28.89S' → 'Within ~1 hour'."""
-        match = re.match(
-            r"PT(?:(\d+)H)?(?:(\d+)M)?(?:[\d.]+S)?", iso
-        )
-        if not match:
-            return "Unknown"
-
-        hours = int(match.group(1) or 0)
-        minutes = int(match.group(2) or 0)
-
-        if hours == 0 and minutes == 0:
-            return "Within minutes"
-        if hours == 0:
-            return f"Within ~{minutes} min"
-        if minutes == 0:
-            return f"Within ~{hours} hour{'s' if hours > 1 else ''}"
-        return f"Within ~{hours}h {minutes}m"
+def _upper(value) -> Optional[str]:
+    return str(value).strip().upper() if value else None

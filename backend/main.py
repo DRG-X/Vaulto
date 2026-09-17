@@ -17,18 +17,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from pydantic import ValidationError
 
 from schemas import (
     CompareRequest, CompareResponse,
     ProfileCreate, ProfileResponse, UserStatusResponse,
     UserSync, UserRead, UserUpdate,
     OnboardingComplete,
-    ComparisonCreate, ComparisonRead,
+    ComparisonCreate, ComparisonRead, SortMode,
     RateAlertCreate, RateAlertRead, RateAlertUpdate,
     ContactMessage,
     ClickCreate,
 )
-from engine.comparator import compare
+from decimal import Decimal
+
+from engine.comparator import QuotePools, compare, fetch_pools, rank_pools
 
 import models
 from database import Base, engine, get_db
@@ -338,49 +341,101 @@ async def get_rates(
     from_currency: str = Query(..., alias="from"),
     to_currency: str   = Query(..., alias="to"),
     amount: float      = Query(..., gt=0),
+    sort_by: SortMode  = Query(SortMode.CHEAPEST, description="cheapest | fastest | lowest_fee | best_rate | best_value"),
+    max_eta_minutes: Optional[int] = Query(None, gt=0, description="Drop quotes that cannot arrive this fast"),
+    pay_in_method: Optional[str]   = Query(None, description="e.g. BANK, DEBIT, CREDIT"),
+    pay_out_method: Optional[str]  = Query(None, description="e.g. BANK_DEPOSIT, CASH_PICKUP"),
+    include_promo: bool = Query(True, description="Include first-transfer promotional rates"),
 ):
     """
     Public GET endpoint for the results page.
-    Checks Redis cache first (bucketed by nearest-50 amount).
-    Falls back to the live comparator engine on a miss.
-    Returns { results, stale, no_data, cached }.
+
+    Checks Redis cache first, keyed on the EXACT amount (it used to bucket to
+    the nearest 50, which served a comparison computed for a different amount
+    than the one asked for). Falls back to the live comparator on a miss.
+
+    Returns { results, best_provider, best_by, mid_market_rate, savings_*,
+    failed_providers, filtered_out, stale, no_data, cached }.
     """
     from_upper = from_currency.upper()
     to_upper   = to_currency.upper()
 
-    # ── Cache hit ─────────────────────────────────────────────────────────────
-    cached = await get_cached_rates(from_upper, to_upper, amount)
-    if cached:
-        logger.info("get_rates: returning cached response for %s→%s %.2f", from_upper, to_upper, amount)
-        return {**cached, "stale": False, "cached": True}
-
-    # ── Live fetch ────────────────────────────────────────────────────────────
-    req = CompareRequest(
-        amount=amount,
-        currency_from=from_upper,
-        currency_to=to_upper,
-    )
     try:
-        result = await compare(req)
-        quotes_data = [q.model_dump() for q in result.quotes]
+        req = CompareRequest(
+            amount=amount,
+            currency_from=from_upper,
+            currency_to=to_upper,
+            sort_by=sort_by,
+            max_eta_minutes=max_eta_minutes,
+            pay_in_method=pay_in_method,
+            pay_out_method=pay_out_method,
+            include_promo=include_promo,
+        )
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # What we cache is the PROVIDER DATA, not the ranked response.
+    #
+    # Filters and sort modes never change what we ask the providers for, only
+    # how their answers are presented — so caching the ranked output would key
+    # on five extra fields and turn nearly every request into a fresh fan-out
+    # to APIs that rate-limit. Caching the fetch instead means one upstream
+    # round per (corridor, amount), and every filter combination re-ranks off
+    # it for free, in microseconds.
+    cached = await get_cached_rates(from_upper, to_upper, amount)
+    was_cached = False
+    try:
+        if cached:
+            pools = QuotePools.from_dict(cached)
+            was_cached = True
+            logger.info("get_rates: cache HIT for %s→%s %s", from_upper, to_upper, amount)
+        else:
+            pools = await fetch_pools(Decimal(str(amount)), from_upper, to_upper)
+            await set_cached_rates(from_upper, to_upper, amount, pools.to_dict())
+    except Exception:
+        logger.exception("get_rates: provider fetch failed")
+        return {
+            "results": [], "stale": False, "no_data": True,
+            "failed_providers": [], "filtered_out": [],
+            "reason": "Internal error", "cached": False,
+        }
+
+    try:
+        result = rank_pools(pools, req)
         response = {
-            "results": quotes_data,
+            "results": [q.model_dump() for q in result.quotes],
             "best_provider": result.best_provider.provider,
+            "best_by": result.best_by,
+            "mid_market_rate": result.mid_market_rate,
+            "mid_market_rate_exact": result.mid_market_rate_exact,
+            "mid_market_source": result.mid_market_source,
             "savings_vs_worst": result.savings_vs_worst,
             "savings_vs_average": result.savings_vs_average,
             "failed_providers": result.failed_providers,
+            "errors": [q.model_dump() for q in result.errors],
+            "filtered_out": result.filtered_out,
+            "sort_by": sort_by.value,
             "stale": False,
             "no_data": False,
-            "cached": False,
+            "cached": was_cached,
         }
-        await set_cached_rates(from_upper, to_upper, amount, response)
-        logger.info("get_rates: live response cached for %s→%s %.2f", from_upper, to_upper, amount)
         return response
-    except ValueError:
-        return {"results": [], "stale": False, "no_data": True, "failed_providers": [], "cached": False}
+    except ValueError as e:
+        # No provider could quote, or every one was filtered out. Surface the
+        # reason instead of an anonymous empty list — "no results" and "your
+        # filter excluded everything" need different fixes from the user.
+        return {
+            "results": [], "stale": False, "no_data": True,
+            "failed_providers": [], "filtered_out": [],
+            "reason": str(e), "cached": False,
+        }
     except Exception:
         logger.exception("get_rates: unexpected error")
-        return {"results": [], "stale": False, "no_data": True, "failed_providers": [], "cached": False}
+        return {
+            "results": [], "stale": False, "no_data": True,
+            "failed_providers": [], "filtered_out": [],
+            "reason": "Internal error", "cached": False,
+        }
 
 
 app.include_router(rates_router)
