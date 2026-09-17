@@ -90,8 +90,13 @@ class RawQuote:
     rate_type: str = "base"
 
     #: Mid-market rate for the corridor, when the provider publishes one.
-    #: Wise's comparison endpoint does; it is the cleanest reference we get.
+    #: Wise's comparison endpoint does, and XE's currency-data API does.
     mid_market_rate: Optional[Decimal] = None
+
+    #: True when this quote exists ONLY to supply `mid_market_rate`. The
+    #: engine harvests the reference and does not rank the quote — see
+    #: `ProviderMeta.rate_reference_only`.
+    reference_only: bool = False
 
     #: Every delivery option the provider offered, for transparency and for
     #: filter modes that want a non-default option (e.g. fastest).

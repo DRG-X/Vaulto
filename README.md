@@ -76,6 +76,8 @@ Flint is a real-time comparison tool that fetches live quotes from **Wise**, **R
 flint/
 ├── backend/
 │   ├── main.py                 # FastAPI app + CORS + routes
+│   ├── scripts/
+│   │   └── verify_providers.py # Check every provider against its live endpoint
 │   ├── schemas.py              # Pydantic models (shared data contract)
 │   ├── money.py                # Decimal money core: exponents, half-up rounding
 │   ├── delivery.py             # ISO-8601 / speed codes → minutes
@@ -83,18 +85,26 @@ flint/
 │   ├── requirements.txt
 │   ├── .env.example
 │   ├── providers/
-│   │   ├── __init__.py         # Exports ALL_PROVIDERS list
+│   │   ├── registry.py         # ALL_PROVIDERS + corridor/credential selection
+│   │   ├── meta.py             # Category, corridors, credentials, avoid flags
 │   │   ├── base.py             # Abstract BaseProvider + exact JSON decoding
 │   │   ├── quote.py            # RawQuote + FeeModel (deducted vs added)
-│   │   ├── wise.py             # Wise: /gateway/v3/comparisons
+│   │   ├── partner_base.py     # Shared plumbing for credential-gated APIs
+│   │   ├── wise.py             # Wise: /gateway/v3/comparisons (both directions)
 │   │   ├── remitly.py          # Remitly: /v3/calculator/estimate
-│   │   └── western_union.py    # WU: /wuconnect/prices/catalog
+│   │   ├── western_union.py    # WU: /wuconnect/prices/catalog
+│   │   ├── xe.py               # XE: mid-market reference only
+│   │   ├── ofx.py, instarem.py, airwallex.py, revolut.py
+│   │   └── scrapers/
+│   │       ├── sites.py        # 9 scrape providers as editable config rows
+│   │       ├── engine.py       # One provider class, driven by SiteConfig
+│   │       └── extract.py      # Rate extraction, fails rather than guesses
 │   ├── engine/
-│   │   ├── __init__.py
 │   │   ├── normalize.py        # Re-base onto one basis + total cost
 │   │   ├── ranking.py          # Sort modes + filters
-│   │   └── comparator.py       # Concurrent fetch, normalize, filter, rank
-│   └── tests/                  # 128 tests over recorded provider payloads
+│   │   ├── sanity.py           # Reject rates that cannot be right
+│   │   └── comparator.py       # Select, fetch, normalize, filter, rank
+│   └── tests/                  # 190 tests
 │
 └── frontend/
     ├── next.config.js
@@ -377,7 +387,7 @@ outage should never end the comparison.
 cd backend && python -m pytest tests/ -q
 ```
 
-128 tests covering Decimal precision and rounding, ISO-4217 minor units,
+190 tests covering Decimal precision and rounding, ISO-4217 minor units,
 delivery parsing, fee-model re-basing, the five sort modes, the filters, and a
 full three-provider comparison.
 
@@ -410,17 +420,127 @@ Set env var: `NEXT_PUBLIC_API_URL=https://your-backend.railway.app`
 
 ---
 
-## Supported Currency Pairs
+## Providers
 
-Any pair where all three providers operate. Best coverage for:
+Eighteen providers across both directions of the AUD ↔ INR corridor, covering
+every **Critical** and **High** priority row of the provider master list.
 
-| Send | Receive |
-|------|---------|
-| USD | INR, PHP, MXN, BDT, PKR, NGN, KES, VND, THB, EUR, GBP |
-| GBP | EUR, INR, USD, AUD |
-| EUR | GBP, USD, INR |
-| CAD | INR, PHP, USD |
-| AUD | INR, PHP, USD |
+### Send AUD (Australia → India)
+
+| Provider | Priority | Integration | Notes |
+|---|---|---|---|
+| Wise | 1 | Public API | Quotes at mid-market; publishes the reference rate |
+| Remitly | 1 | Public API | Calculator API; base rate preferred over promo |
+| XE | 1 | Partner API | **Reference only** — see below |
+| Western Union | 2 | Public API | Uses the PRICECATALOG JSON, not a scrape |
+| OFX | 2 | Partner API | Fee-free above A$200 |
+| InstaReM | 2 | Partner API | Zero-fee model; cost is in the rate |
+| Airwallex | 2 | Partner API | Two-step auth, token cached |
+| Revolut | 2 | Partial API | Weekend surcharge modelled |
+| CommBank | 1 | Scrape | `avoid` — the gap Vaulto exists to show |
+| ANZ · Westpac | 2 | Scrape | `avoid` |
+
+### Send INR (India → Australia)
+
+| Provider | Priority | Integration | Notes |
+|---|---|---|---|
+| Wise | 1 | Public API | Same integration, direction reversed — "Wise India" needs no separate provider |
+| SBI | 1 | Scrape | `avoid` — where most parents start |
+| HDFC · ICICI | 2 | Scrape | `avoid` |
+| BookMyForex | 2 | Scrape | The realistic India-side benchmark |
+| ExTravelMoney | 2 | Scrape | |
+| HOP Remit | 2 | Scrape | **Benchmark only — never displayed** |
+
+### Three things worth knowing
+
+**XE is a reference, not a quote.** `xecdapi.xe.com` is XE's currency-data
+product: it returns the mid-market rate, not XE Money Transfer's retail
+pricing. Ranking it as a quote would show XE at a flat 0% markup and win every
+comparison at a price nobody can buy. It is wired in as the neutral mid-market
+reference instead — which is more valuable, since it removes the dependency on
+a competitor (Wise) being reachable for markup to be computable.
+
+**Providers are selected before they are called.** A provider that does not
+serve the corridor, or whose partner key is not configured, is never asked —
+it appears in `unavailable_providers` with a reason, not in `failed_providers`.
+"Does not serve AUD→INR", "needs an API key you have to apply for" and "it
+broke" are three different problems, and conflating them makes a healthy
+system look broken while hiding the provider that genuinely failed.
+
+**Banks are in the comparison on purpose.** They carry `avoid: true` and
+`category: "bank"` so the UI can show the gap rather than quietly ranking them
+last.
+
+---
+
+## Configuring partner APIs
+
+Five providers need credentials you apply for. Without them they are skipped
+cleanly — nothing fails. Add to `backend/.env`:
+
+```bash
+XE_ACCOUNT_ID=...          # xecdapi.xe.com — supplies the mid-market reference
+XE_API_KEY=...
+OFX_API_KEY=...            # ofx.com/en-au/business/api
+INSTAREM_API_KEY=...       # partnerships@instarem.com
+AIRWALLEX_CLIENT_ID=...    # developer.airwallex.com
+AIRWALLEX_API_KEY=...
+REVOLUT_API_KEY=...        # developer.revolut.com
+```
+
+---
+
+## ⚠️ Verify before you deploy
+
+The fifteen providers added from the master list were written against
+published documentation and the usual shape of bank rate pages. **None could
+be tested against a live response** — the environment they were written in
+blocks every provider host at the network policy level. The API field names
+and, especially, the HTML selectors in `providers/scrapers/sites.py` are
+informed guesses.
+
+Run this from a network that can reach them:
+
+```bash
+cd backend
+python -m scripts.verify_providers --corridor AUD:INR --amount 1000
+python -m scripts.verify_providers --corridor INR:AUD --amount 100000
+```
+
+Each provider reports `OK`, `NO KEY`, `N/A` (wrong corridor — expected) or
+`BROKEN`. Exit status is non-zero if anything is broken, so it can gate a
+deploy.
+
+A `BROKEN` scraper is almost always a selector: open the page, find the column
+that actually holds the telegraphic-transfer rate, and edit `sites.py`. That
+is a data change, not a code change — which is why the nine scrapers are one
+engine and nine rows of config rather than nine classes.
+
+**A parse that succeeds can still read the wrong column,** so spot-check the
+numbers against each provider's own site. Two guards limit the damage in the
+meantime:
+
+* Scrapers that cannot find a rate return an error. They never guess, and
+  never fall back to a stale constant — a wrong bank rate would rank a bank as
+  the best deal, the exact opposite of why those providers are here.
+* `engine/sanity.py` rejects any rate more than 25% from the corridor
+  consensus. That catches the dangerous failure: six India-side scrapers must
+  invert their rate card (`"AUD 57.50"` means one dollar costs 57.50 rupees),
+  and an inversion done backwards is ~3,300x too good and would win
+  everything. Real spreads are a few percent, so the band cannot reject an
+  honest quote.
+
+---
+
+## Adding a provider from the master list
+
+The Medium and Low priority rows are mostly one entry each:
+
+* **Scrape-based** (NAB, MoneyGram, Thomas Cook, Axis Forex) — add a
+  `SiteConfig` row to `providers/scrapers/sites.py`. No code.
+* **API-based** (WorldRemit, CurrencyFair, TorFX, Moneycorp, Niyo, SingX) —
+  subclass `PartnerAPIProvider`, implement `_build_request` and `_parse`, and
+  register it in `providers/registry.py`.
 
 ---
 

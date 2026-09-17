@@ -414,6 +414,7 @@ async def get_rates(
             "failed_providers": result.failed_providers,
             "errors": [q.model_dump() for q in result.errors],
             "filtered_out": result.filtered_out,
+            "unavailable_providers": result.unavailable_providers,
             "sort_by": sort_by.value,
             "stale": False,
             "no_data": False,

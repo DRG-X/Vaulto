@@ -40,6 +40,7 @@ import httpx
 
 from money import D, ZERO, floor_money
 from providers.base import BaseProvider, decode_json_exact
+from providers.meta import Category, Integration, ProviderMeta
 from providers.quote import FeeModel, RawQuote
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,15 @@ class RemitlyUnsupportedCorridor(Exception):
 
 class RemitlyProvider(BaseProvider):
     name = "Remitly"
+
+    meta = ProviderMeta(
+        name="Remitly",
+        category=Category.FINTECH,
+        integration=Integration.PUBLIC_API,
+        priority=1,
+        website="https://www.remitly.com",
+        notes="Calculator API is public; partner API would add richer data.",
+    )
 
     ESTIMATE_URL = "https://api.remitly.io/v3/calculator/estimate"
 

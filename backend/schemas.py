@@ -53,6 +53,15 @@ class ProviderQuote(BaseModel):
     total_cost: Optional[float] = None
     total_cost_pct: Optional[float] = None
 
+    # ── Who this provider is ──────────────────────────────────────────────
+    #: "fintech" | "bank" | "neobank" | "legacy" | "broker" | "p2p"
+    category: Optional[str] = None
+    #: 1 = Critical .. 4 = Low, from the provider master list.
+    priority: Optional[int] = None
+    #: Known-bad pricing, kept in the comparison to show the gap. The big
+    #: banks are here precisely because they are the expensive option.
+    avoid: bool = False
+
     # ── Provenance ────────────────────────────────────────────────────────
     fee_model: Optional[str] = None            # "deducted" | "added"
     principal_amount: Optional[float] = None   # amount actually converted
@@ -159,6 +168,13 @@ class CompareResponse(BaseModel):
 
     #: Quotes dropped by the request's filters (not failures).
     filtered_out: List[str] = []
+
+    #: Providers that were never called, and why — {provider: reason}.
+    #: Deliberately separate from `failed_providers`: "does not serve this
+    #: corridor" and "needs an API key you have to apply for" are not
+    #: outages, and showing them as failures makes a healthy system look
+    #: broken and hides the ones that genuinely broke.
+    unavailable_providers: Dict[str, str] = {}
 
 
 # ── User schemas ──────────────────────────────────────────────────────────────

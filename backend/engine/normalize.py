@@ -74,6 +74,7 @@ def normalize_quote(
     raw: RawQuote,
     requested_amount: Decimal,
     mid_market_rate: Optional[Decimal] = None,
+    meta=None,
 ) -> ProviderQuote:
     """
     Convert a provider's `RawQuote` into a comparable `ProviderQuote`.
@@ -167,6 +168,9 @@ def normalize_quote(
         fx_markup_cost=to_float(markup_cost),
         total_cost=to_float(total_cost),
         total_cost_pct=to_float(total_cost_pct),
+        category=meta.category.value if meta else None,
+        priority=meta.priority if meta else None,
+        avoid=bool(meta.avoid) if meta else False,
         fee_model=raw.fee_model.value,
         principal_amount=to_float(principal),
         normalized=normalized,
@@ -208,9 +212,12 @@ def pick_mid_market_rate(raws: list[RawQuote]) -> tuple[Optional[Decimal], Optio
     """
     Choose a reference mid-market rate from whatever the providers published.
 
-    Wise quotes at the mid-market rate and returns it explicitly, which makes
-    it the best reference we get without a separate FX feed. We prefer it, then
-    any other provider that publishes one.
+    Preference order matters. XE's currency-data API is a NEUTRAL source: it
+    sells data, not transfers, so it has no stake in how the comparison comes
+    out. Wise is next — it quotes at mid-market and publishes the rate — but
+    it is also a competitor in the same table, and measuring everyone's markup
+    against one competitor's own number is a weaker position than measuring it
+    against an independent feed.
 
     Returns (rate, source) — or (None, None), in which case markup is simply
     not reported. That is deliberate: inventing a reference from the best
@@ -221,7 +228,7 @@ def pick_mid_market_rate(raws: list[RawQuote]) -> tuple[Optional[Decimal], Optio
     if not candidates:
         return (None, None)
 
-    for preferred in ("Wise",):
+    for preferred in ("XE", "Wise"):
         for raw in candidates:
             if raw.provider == preferred:
                 return (quantize_rate(raw.mid_market_rate), raw.provider)

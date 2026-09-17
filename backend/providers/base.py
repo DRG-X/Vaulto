@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from money import D
+from providers.meta import Category, Integration, ProviderMeta
 from providers.quote import RawQuote
 from schemas import ProviderQuote
 
@@ -39,6 +40,16 @@ def decode_json_exact(response: httpx.Response) -> Any:
 
 class BaseProvider(ABC):
     name: str = "unknown"
+
+    #: Static facts about this provider — corridors, credentials, category.
+    #: The registry reads it to decide whether to call the provider at all,
+    #: so a provider that cannot serve a corridor is never asked rather than
+    #: being asked and reported as having failed.
+    meta: ProviderMeta = ProviderMeta(
+        name="unknown",
+        category=Category.FINTECH,
+        integration=Integration.PUBLIC_API,
+    )
 
     @abstractmethod
     async def fetch_raw_quote(

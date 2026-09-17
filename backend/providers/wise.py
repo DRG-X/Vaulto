@@ -36,6 +36,7 @@ import httpx
 import delivery
 from money import D, ZERO
 from providers.base import BaseProvider, decode_json_exact
+from providers.meta import Category, Integration, ProviderMeta
 from providers.quote import FeeModel, RawQuote
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,19 @@ logger = logging.getLogger(__name__)
 
 class WiseProvider(BaseProvider):
     name = "Wise"
+
+    #: One integration covers both directions. "Wise India" on the provider
+    #: sheet is this same endpoint with source and target reversed, so it needs
+    #: no separate provider — only the corridor rule below, which already
+    #: admits INR->AUD.
+    meta = ProviderMeta(
+        name="Wise",
+        category=Category.FINTECH,
+        integration=Integration.PUBLIC_API,
+        priority=1,
+        website="https://wise.com",
+        notes="Quotes at mid-market; supplies the reference rate for markup.",
+    )
 
     COMPARISONS_URL = "https://wise.com/gateway/v3/comparisons"
     LIVE_RATE_URL = "https://wise.com/rates/live"

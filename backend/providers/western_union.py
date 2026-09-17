@@ -42,6 +42,7 @@ import httpx
 import delivery
 from money import D, ZERO, floor_money
 from providers.base import BaseProvider, decode_json_exact
+from providers.meta import Category, Integration, ProviderMeta
 from providers.quote import FeeModel, RawQuote
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,18 @@ logger = logging.getLogger(__name__)
 
 class WesternUnionProvider(BaseProvider):
     name = "Western Union"
+
+    #: The sheet lists WU as scrape-only. It is not: the pricing catalog
+    #: endpoint behind their calculator returns the full rate matrix as JSON,
+    #: which is what this provider uses instead of driving a browser.
+    meta = ProviderMeta(
+        name="Western Union",
+        category=Category.LEGACY,
+        integration=Integration.PUBLIC_API,
+        priority=2,
+        website="https://www.westernunion.com",
+        notes="Uses the PRICECATALOG JSON endpoint, not a page scrape.",
+    )
 
     CATALOG_URL = "https://www.westernunion.com/wuconnect/prices/catalog"
 

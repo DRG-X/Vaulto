@@ -1,5 +1,5 @@
-from providers.wise import WiseProvider
-from providers.remitly import RemitlyProvider
-from providers.western_union import WesternUnionProvider
+"""Provider package — see `registry.py` for selection rules."""
 
-ALL_PROVIDERS = [WiseProvider(), RemitlyProvider(), WesternUnionProvider()]
+from providers.registry import ALL_PROVIDERS, Selection, select_providers
+
+__all__ = ["ALL_PROVIDERS", "Selection", "select_providers"]
