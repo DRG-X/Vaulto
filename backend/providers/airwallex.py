@@ -55,7 +55,12 @@ class AirwallexProvider(PartnerAPIProvider):
         category=Category.FINTECH,
         integration=Integration.PARTNER_API,
         priority=2,
+        # Receives rupees; cannot originate them (no RBI AD-II licence).
+        cannot_send_from=("INR",),
         credentials=("AIRWALLEX_CLIENT_ID", "AIRWALLEX_API_KEY"),
+        min_amount=Decimal('1'),
+        max_amount=None,
+        limits_currency="AUD",
         website="https://developer.airwallex.com",
         notes="Two-step auth; token cached in-process.",
     )

@@ -46,6 +46,28 @@ class PartnerAPIProvider(BaseProvider):
 
     TIMEOUT = 15
 
+    #: Env var that overrides this provider's base URL, when it declares one.
+    URL_ENV: Optional[str] = None
+
+    #: Documented endpoint. Some partner APIs publish no URL at all ("contact
+    #: us"), in which case this is empty and `URL_ENV` is the only way to set
+    #: one — better than inventing a plausible-looking URL that quietly 404s
+    #: and reads as an outage.
+    DEFAULT_URL: str = ""
+
+    def endpoint(self) -> str:
+        """The URL to call: the env override if set, else the documented one."""
+        if self.URL_ENV:
+            override = (os.getenv(self.URL_ENV) or "").strip()
+            if override:
+                return override
+        if not self.DEFAULT_URL:
+            raise ValueError(
+                f"{self.name} publishes no publicly documented endpoint. "
+                f"Set {self.URL_ENV} to the URL your partner agreement gives you."
+            )
+        return self.DEFAULT_URL
+
     def credentials(self) -> Dict[str, str]:
         """Current values of every credential this provider declares."""
         return {

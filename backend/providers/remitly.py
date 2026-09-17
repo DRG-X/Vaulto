@@ -71,6 +71,12 @@ class RemitlyProvider(BaseProvider):
         category=Category.FINTECH,
         integration=Integration.PUBLIC_API,
         priority=1,
+        # Receives rupees; cannot originate them (no RBI AD-II licence).
+        cannot_send_from=("INR",),
+        # Remitly caps outbound transfers at A$30,000.
+        min_amount=Decimal('10'),
+        max_amount=Decimal('30000'),
+        limits_currency="AUD",
         website="https://www.remitly.com",
         notes="Calculator API is public; partner API would add richer data.",
     )

@@ -40,7 +40,13 @@ class OFXProvider(PartnerAPIProvider):
         category=Category.FINTECH,
         integration=Integration.PARTNER_API,
         priority=2,
+        # Receives rupees; cannot originate them (no RBI AD-II licence).
+        cannot_send_from=("INR",),
         credentials=("OFX_API_KEY",),
+        # A$200 minimum — the same threshold above which OFX waives its fee.
+        min_amount=Decimal('200'),
+        max_amount=None,
+        limits_currency="AUD",
         website="https://www.ofx.com/en-au/business/api",
         notes="No transfer fee above A$200; margin is in the rate.",
     )

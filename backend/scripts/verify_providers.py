@@ -25,7 +25,9 @@ For each provider it reports one of:
     OK        a plausible quote came back — check the numbers against the
               provider's own website before trusting them
     NO KEY    credentials not configured; nothing to test yet
-    N/A       does not serve this corridor (expected, not a problem)
+    N/A       does not serve this corridor or this amount (expected)
+    NEEDS JS  the rate lives behind a JavaScript calculator; it needs the
+              calculator's JSON endpoint or Playwright, not a selector fix
     BROKEN    reached the provider and could not parse the answer — this is
               the one to fix, and the error says where
 
@@ -66,6 +68,20 @@ async def probe(provider, amount: Decimal, send: str, receive: str) -> Tuple[str
     if not provider.meta.supports(send, receive):
         return ("N/A", f"serves {', '.join('->'.join(c) for c in provider.meta.corridors)}")
 
+    accepted, why = provider.meta.accepts_amount(amount, send)
+    if not accepted:
+        return ("N/A", why)
+
+    if provider.meta.needs_browser:
+        # Checked before calling, so a genuinely dead URL on one of these can
+        # still be reported as BROKEN by whatever eventually replaces the
+        # stub — rather than every error being excused as "needs JS".
+        return (
+            "NEEDS JS",
+            "rate is behind a JavaScript calculator — find the JSON endpoint "
+            "it calls (as the Western Union provider does) or use Playwright",
+        )
+
     missing = provider.meta.missing_credentials
     if missing:
         return ("NO KEY", f"set {', '.join(missing)}")
@@ -76,6 +92,9 @@ async def probe(provider, amount: Decimal, send: str, receive: str) -> Tuple[str
         return ("BROKEN", f"{type(e).__name__}: {e}")
 
     if raw.error:
+        # Reached here means the provider WAS called, so a failure is a real
+        # failure. Relabelling every error from a JS-backed provider as
+        # "NEEDS JS" would mean a dead URL could never fail the deploy gate.
         return ("BROKEN", raw.error)
 
     if raw.reference_only:
@@ -119,10 +138,11 @@ async def run(corridors: List[Tuple[str, str]], amount: Decimal) -> int:
             zip(relevant, results), key=lambda pair: (pair[0].meta.priority, pair[0].name)
         ):
             tag = {
-                "OK": colour("  OK   ", GREEN),
-                "BROKEN": colour("BROKEN ", RED),
-                "NO KEY": colour("NO KEY ", YELLOW),
-                "N/A": colour("  N/A  ", DIM),
+                "OK": colour("  OK    ", GREEN),
+                "BROKEN": colour("BROKEN  ", RED),
+                "NO KEY": colour("NO KEY  ", YELLOW),
+                "NEEDS JS": colour("NEEDS JS", YELLOW),
+                "N/A": colour("  N/A   ", DIM),
             }[status]
 
             flags = []

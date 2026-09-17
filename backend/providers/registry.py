@@ -17,7 +17,8 @@ you have to apply for", and "it broke" should never be the same message.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from decimal import Decimal
+from typing import Dict, List, Optional, Sequence
 
 from providers.base import BaseProvider
 
@@ -30,6 +31,10 @@ from providers.ofx import OFXProvider
 from providers.instarem import InstaRemProvider
 from providers.airwallex import AirwallexProvider
 from providers.revolut import RevolutProvider
+from providers.currencyfair import CurrencyFairProvider
+from providers.worldremit import WorldRemitProvider
+from providers.brokers import MoneycorpProvider, TorFXProvider
+from providers.neobanks import NiyoGlobalProvider, SingXProvider
 
 # ── Scrape-only providers (rate pages, no API) ──────────────────────────────
 from providers.scrapers import SCRAPE_PROVIDERS
@@ -47,7 +52,16 @@ ALL_PROVIDERS: List[BaseProvider] = [
     InstaRemProvider(),
     AirwallexProvider(),
     RevolutProvider(),
-    # Scrape-only: AU banks, India banks, India fintech, benchmark-only
+    # Priority 3 — Medium
+    CurrencyFairProvider(),
+    WorldRemitProvider(),
+    TorFXProvider(),
+    NiyoGlobalProvider(),
+    # Priority 4 — Low
+    SingXProvider(),
+    MoneycorpProvider(),
+    # Scrape-only: AU banks, India banks, India fintech, JS calculators,
+    # benchmark-only. Ordered by priority inside the scrapers package.
     *SCRAPE_PROVIDERS,
 ]
 
@@ -64,6 +78,12 @@ class Selection:
     #: Provider name -> the env vars it still needs.
     needs_credentials: Dict[str, List[str]] = field(default_factory=dict)
 
+    #: Provider name -> why this amount falls outside its transfer band.
+    out_of_limits: Dict[str, str] = field(default_factory=dict)
+
+    #: Provider name -> what it needs to become fetchable at all.
+    needs_browser: Dict[str, str] = field(default_factory=dict)
+
     #: Fetched for benchmarking but never shown to users.
     benchmark: List[BaseProvider] = field(default_factory=list)
 
@@ -79,6 +99,8 @@ class Selection:
                 + ", ".join(missing)
                 + " to enable this provider"
             )
+        out.update(self.out_of_limits)
+        out.update(self.needs_browser)
         return out
 
 
@@ -87,14 +109,19 @@ def select_providers(
     currency_to: str,
     providers: Sequence[BaseProvider] | None = None,
     include_benchmark: bool = False,
+    amount: Optional[Decimal] = None,
 ) -> Selection:
     """
-    Pick the providers worth calling for this corridor.
+    Pick the providers worth calling for this corridor and amount.
 
-    A provider is skipped when it does not serve the corridor, or when a
-    credential it needs is not configured. Benchmark-only providers are
-    separated out: they are fetched (when asked for) so their rates can be
-    tracked, but they never reach the comparison a user sees.
+    A provider is skipped when it does not serve the corridor, when a
+    credential it needs is not configured, or when the amount falls outside
+    the band it will actually move. Benchmark-only providers are separated
+    out: they are fetched (when asked for) so their rates can be tracked, but
+    they never reach the comparison a user sees.
+
+    `amount` is optional so callers that only want to know WHICH providers
+    cover a corridor can ask without inventing one.
     """
     pool = list(providers if providers is not None else ALL_PROVIDERS)
     corridor = f"{currency_from.upper()}->{currency_to.upper()}"
@@ -106,6 +133,26 @@ def select_providers(
         if not meta.supports(currency_from, currency_to):
             selection.out_of_corridor[provider.name] = corridor
             continue
+
+        if meta.needs_browser:
+            # Never call these: a plain fetch cannot reach the rate, so the
+            # request would only buy a timeout and a phantom failure.
+            selection.needs_browser[provider.name] = (
+                "Rate is behind a JavaScript calculator — needs the "
+                "calculator's JSON endpoint or a headless browser"
+            )
+            continue
+
+        # A reference-only source sells data, not transfers, so transfer
+        # limits do not apply to it. Excluding one on an amount would drop the
+        # mid-market yardstick exactly when the comparison is largest.
+        if amount is not None and not meta.rate_reference_only:
+            accepted, reason = meta.accepts_amount(amount, currency_from)
+            if not accepted:
+                # Checked BEFORE credentials so the message names the real
+                # blocker: a partner key will not make TorFX move A$500.
+                selection.out_of_limits[provider.name] = reason
+                continue
 
         missing = meta.missing_credentials
         if missing:

@@ -64,7 +64,12 @@ class RevolutProvider(PartnerAPIProvider):
         category=Category.NEOBANK,
         integration=Integration.PARTIAL_API,
         priority=2,
+        # Receives rupees; cannot originate them (no RBI AD-II licence).
+        cannot_send_from=("INR",),
         credentials=("REVOLUT_API_KEY",),
+        min_amount=Decimal('1'),
+        max_amount=None,
+        limits_currency="AUD",
         website="https://developer.revolut.com",
         notes="Weekend surcharge applies; free plans have monthly FX limits.",
     )

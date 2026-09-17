@@ -54,6 +54,9 @@ class WiseProvider(BaseProvider):
         category=Category.FINTECH,
         integration=Integration.PUBLIC_API,
         priority=1,
+        min_amount=Decimal('1'),
+        max_amount=Decimal('1000000'),
+        limits_currency="AUD",
         website="https://wise.com",
         notes="Quotes at mid-market; supplies the reference rate for markup.",
     )

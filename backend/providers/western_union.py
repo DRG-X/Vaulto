@@ -59,6 +59,12 @@ class WesternUnionProvider(BaseProvider):
         category=Category.LEGACY,
         integration=Integration.PUBLIC_API,
         priority=2,
+        # Receives rupees; cannot originate them (no RBI AD-II licence).
+        cannot_send_from=("INR",),
+        # WU caps AU-originated transfers at A$50,000.
+        min_amount=Decimal('1'),
+        max_amount=Decimal('50000'),
+        limits_currency="AUD",
         website="https://www.westernunion.com",
         notes="Uses the PRICECATALOG JSON endpoint, not a page scrape.",
     )

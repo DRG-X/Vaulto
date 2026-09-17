@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from providers.meta import Category
 
@@ -75,6 +75,19 @@ class SiteConfig:
     #: Fetched for benchmarking only; never shown to users.
     benchmark_only: bool = False
 
+    #: Transfer band, in the SEND currency. None means no published limit.
+    min_amount: Optional[Decimal] = None
+    max_amount: Optional[Decimal] = None
+
+    #: True when the rate lives behind a JavaScript calculator rather than in
+    #: server-rendered HTML. A plain GET returns the page shell with no rate
+    #: in it, so these need either the JSON endpoint the calculator calls or a
+    #: real browser (Playwright). They are registered so the corridor coverage
+    #: is honest, and the verification script reports them distinctly instead
+    #: of as a generic parse failure — "needs a browser" and "the selector
+    #: broke" are different jobs.
+    requires_js: bool = False
+
     notes: str = ""
 
 
@@ -82,6 +95,8 @@ class SiteConfig:
 AU_BANKS: Sequence[SiteConfig] = (
     SiteConfig(
         name="CommBank",
+        min_amount=Decimal("1"),
+        max_amount=None,
         url="https://www.commbank.com.au/personal/international/foreign-exchange-rates",
         category=Category.BANK,
         priority=1,
@@ -96,6 +111,8 @@ AU_BANKS: Sequence[SiteConfig] = (
     ),
     SiteConfig(
         name="ANZ",
+        min_amount=Decimal("1"),
+        max_amount=None,
         url="https://www.anz.com.au/personal/travel-international/foreign-exchange/",
         category=Category.BANK,
         priority=2,
@@ -108,7 +125,25 @@ AU_BANKS: Sequence[SiteConfig] = (
         avoid=True,
     ),
     SiteConfig(
+        name="NAB",
+        min_amount=Decimal("1"),
+        max_amount=None,
+        url="https://www.nab.com.au/personal/international-banking/foreign-exchange-rates",
+        category=Category.BANK,
+        priority=3,
+        send_currency="AUD",
+        receive_currency="INR",
+        fee=Decimal("18"),
+        fee_note="A$18-22 international transfer fee",
+        column_hints=("TT SELL", "TELEGRAPHIC", "SELL"),
+        currency_names=("INDIAN RUPEE",),
+        avoid=True,
+        notes="Big four; marginally better than CommBank, still far off fintech rates.",
+    ),
+    SiteConfig(
         name="Westpac",
+        min_amount=Decimal("1"),
+        max_amount=None,
         url="https://www.westpac.com.au/personal-banking/foreign-exchange/exchange-rates/",
         category=Category.BANK,
         priority=2,
@@ -128,6 +163,8 @@ AU_BANKS: Sequence[SiteConfig] = (
 IN_BANKS: Sequence[SiteConfig] = (
     SiteConfig(
         name="SBI",
+        min_amount=Decimal("1000"),
+        max_amount=None,
         url="https://www.sbi.co.in/web/interest-rates/forex-card-rates",
         category=Category.BANK,
         priority=1,
@@ -145,6 +182,8 @@ IN_BANKS: Sequence[SiteConfig] = (
     ),
     SiteConfig(
         name="HDFC Bank",
+        min_amount=Decimal("1000"),
+        max_amount=None,
         url="https://www.hdfcbank.com/personal/resources/rates",
         category=Category.BANK,
         priority=2,
@@ -161,6 +200,8 @@ IN_BANKS: Sequence[SiteConfig] = (
     ),
     SiteConfig(
         name="ICICI Bank",
+        min_amount=Decimal("1000"),
+        max_amount=None,
         url="https://www.icicibank.com/personal-banking/forex/fx-rates",
         category=Category.BANK,
         priority=2,
@@ -175,6 +216,25 @@ IN_BANKS: Sequence[SiteConfig] = (
         currency_names=("AUSTRALIAN DOLLAR",),
         avoid=True,
     ),
+    SiteConfig(
+        name="Axis Forex",
+        min_amount=Decimal("5000"),
+        max_amount=None,
+        url="https://www.axisbank.com/forex/forex-card/exchange-rate",
+        category=Category.BANK,
+        priority=3,
+        send_currency="INR",
+        receive_currency="AUD",
+        fee=Decimal("300"),
+        fee_note="₹300-800 plus GST",
+        eta_min=2 * DAY,
+        eta_max=3 * DAY,
+        quotes_target_in_source=True,
+        column_hints=("TT SELL", "TT SELLING", "SELL"),
+        currency_names=("AUSTRALIAN DOLLAR",),
+        avoid=True,
+        notes="Axis Bank's forex arm; popular in metro cities.",
+    ),
 )
 
 
@@ -182,6 +242,8 @@ IN_BANKS: Sequence[SiteConfig] = (
 IN_FINTECH: Sequence[SiteConfig] = (
     SiteConfig(
         name="BookMyForex",
+        min_amount=Decimal("1000"),
+        max_amount=Decimal("1500000"),
         url="https://www.bookmyforex.com/forex-rates/",
         category=Category.FINTECH,
         priority=2,
@@ -198,6 +260,8 @@ IN_FINTECH: Sequence[SiteConfig] = (
     ),
     SiteConfig(
         name="ExTravelMoney",
+        min_amount=Decimal("500"),
+        max_amount=Decimal("1000000"),
         url="https://www.extravelmoney.com/forex-rates/",
         category=Category.FINTECH,
         priority=2,
@@ -211,6 +275,69 @@ IN_FINTECH: Sequence[SiteConfig] = (
         column_hints=("SELL", "RATE"),
         currency_names=("AUSTRALIAN DOLLAR",),
     ),
+    SiteConfig(
+        name="Thomas Cook India",
+        min_amount=Decimal("5000"),
+        max_amount=Decimal("1500000"),
+        url="https://www.thomascook.in/foreign-exchange/forex-rates",
+        category=Category.LEGACY,
+        priority=3,
+        send_currency="INR",
+        receive_currency="AUD",
+        fee=Decimal("200"),
+        fee_note="₹200-500 plus GST",
+        eta_min=2 * DAY,
+        eta_max=3 * DAY,
+        quotes_target_in_source=True,
+        column_hints=("SELL", "RATE"),
+        currency_names=("AUSTRALIAN DOLLAR",),
+        notes="Legacy brand, heavily trusted by Indian parents aged 40+.",
+    ),
+)
+
+
+#: Providers whose rate lives behind a JavaScript calculator. Registered so
+#: corridor coverage is honest; see `SiteConfig.requires_js` for why a plain
+#: fetch will not get a rate out of them.
+JS_CALCULATORS: Sequence[SiteConfig] = (
+    SiteConfig(
+        name="MoneyGram",
+        min_amount=Decimal("1"),
+        max_amount=Decimal("10000"),
+        url="https://www.moneygram.com/mgo/au/en/",
+        category=Category.LEGACY,
+        priority=3,
+        send_currency="AUD",
+        receive_currency="INR",
+        fee=Decimal("5"),
+        fee_note="A$5-20 depending on speed and payout method",
+        eta_min=15,
+        eta_max=3 * DAY,
+        eta_business_days=False,
+        column_hints=("RATE",),
+        currency_names=("INDIAN RUPEE",),
+        requires_js=True,
+        notes="Still used by older demographics. Needs the calculator's JSON endpoint.",
+    ),
+    SiteConfig(
+        name="Panda Remit",
+        min_amount=Decimal("10"),
+        max_amount=Decimal("50000"),
+        url="https://www.pandaremit.com/en-AU",
+        category=Category.FINTECH,
+        priority=3,
+        send_currency="AUD",
+        receive_currency="INR",
+        fee=Decimal("0"),
+        fee_note="A$0-3 depending on amount",
+        eta_min=60,
+        eta_max=12 * 60,
+        eta_business_days=False,
+        column_hints=("RATE",),
+        currency_names=("INDIAN RUPEE",),
+        requires_js=True,
+        notes="Growing fast with the Asian student community.",
+    ),
 )
 
 
@@ -218,6 +345,8 @@ IN_FINTECH: Sequence[SiteConfig] = (
 BENCHMARK: Sequence[SiteConfig] = (
     SiteConfig(
         name="HOP Remit",
+        min_amount=Decimal("1000"),
+        max_amount=None,
         url="https://www.moneyhop.co/send-money-to-australia",
         category=Category.FINTECH,
         priority=2,
@@ -241,4 +370,6 @@ BENCHMARK: Sequence[SiteConfig] = (
 )
 
 
-ALL_SITES: Tuple[SiteConfig, ...] = (*AU_BANKS, *IN_BANKS, *IN_FINTECH, *BENCHMARK)
+ALL_SITES: Tuple[SiteConfig, ...] = (
+    *AU_BANKS, *IN_BANKS, *IN_FINTECH, *JS_CALCULATORS, *BENCHMARK,
+)

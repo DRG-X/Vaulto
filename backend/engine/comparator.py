@@ -143,7 +143,9 @@ async def fetch_pools(
     Australian corridor and make a healthy system look broken.
     """
     selection = select_providers(
-        currency_from, currency_to, include_benchmark=include_benchmark
+        currency_from, currency_to,
+        include_benchmark=include_benchmark,
+        amount=amount,
     )
     meta_by_name = {p.name: p.meta for p in selection.active + selection.benchmark}
 

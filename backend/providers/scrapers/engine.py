@@ -60,6 +60,10 @@ class ScrapeProvider(BaseProvider):
             corridors=((config.send_currency, config.receive_currency),),
             benchmark_only=config.benchmark_only,
             avoid=config.avoid,
+            needs_browser=config.requires_js,
+            min_amount=config.min_amount,
+            max_amount=config.max_amount,
+            limits_currency=config.send_currency,
             website=config.url,
             notes=config.notes,
         )
@@ -94,6 +98,19 @@ class ScrapeProvider(BaseProvider):
         )
 
         if published is None:
+            if cfg.requires_js:
+                # Distinct message on purpose: "needs a browser" and "the
+                # selector broke" are different jobs, and telling a developer
+                # to go fix a selector on a page that never had one in its
+                # HTML wastes an afternoon.
+                return self._error(
+                    currency_from, currency_to,
+                    f"{self.name}: rate is behind a JavaScript calculator at "
+                    f"{cfg.url} and is not in the served HTML. Either find the "
+                    f"JSON endpoint the calculator calls (as the Western Union "
+                    f"provider does) and write a small API provider for it, or "
+                    f"render the page with Playwright.",
+                )
             return self._error(
                 currency_from, currency_to,
                 f"{self.name}: no {cfg.receive_currency} rate found on {cfg.url} "

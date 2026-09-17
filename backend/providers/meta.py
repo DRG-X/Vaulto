@@ -29,7 +29,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple
+from decimal import Decimal
+from typing import Optional, Tuple
 
 
 class Category(str, Enum):
@@ -74,6 +75,20 @@ class ProviderMeta:
     #: ("AUD", ANY) means "sends Australian dollars anywhere".
     corridors: Tuple[Tuple[str, str], ...] = ANY_CORRIDOR
 
+    #: Currencies this provider cannot SEND FROM, whatever `corridors` allows.
+    #:
+    #: Moving money OUT of India requires an RBI AD-II licence under the
+    #: Liberalised Remittance Scheme. The global fintechs and brokers here
+    #: receive rupees; they do not originate them. Wise is the exception —
+    #: it runs an Indian entity, which is what the provider sheet lists
+    #: separately as "Wise India".
+    #:
+    #: Without this, every AU-side provider would be offered on the INR->AUD
+    #: corridor, fail confusingly, and — for the credential-gated ones —
+    #: quietly burn a partner API call per comparison on a transfer they
+    #: would refuse.
+    cannot_send_from: Tuple[str, ...] = ()
+
     #: Environment variables that must ALL be set for this provider to run.
     credentials: Tuple[str, ...] = ()
 
@@ -93,12 +108,41 @@ class ProviderMeta:
     #: Known-bad pricing kept in the comparison to show the gap.
     avoid: bool = False
 
+    #: True when the rate only exists after JavaScript runs, so no amount of
+    #: HTTP fetching will find it.
+    #:
+    #: These are registered so corridor coverage is honest, but they are NOT
+    #: called: doing so would spend a 20-second timeout on every comparison
+    #: and park two permanent entries in `failed_providers` — precisely the
+    #: "healthy system looks broken" failure this metadata exists to prevent.
+    #: They are reported as unavailable, with what they actually need.
+    needs_browser: bool = False
+
+    # ── Transfer limits ──────────────────────────────────────────────────
+    # Providers will not move any amount you like. TorFX starts at A$2,000;
+    # WorldRemit stops at A$9,000. Quoting either outside its band is not a
+    # near-miss, it is an offer the provider would refuse — and it would
+    # usually WIN, because brokers with high minimums have the best rates.
+    #
+    # Limits are denominated in a specific currency, so they are only applied
+    # when the send currency matches `limits_currency`. Comparing A$2,000
+    # against a rupee amount needs an exchange rate we do not have at
+    # selection time, and a wrong guess there would wrongly exclude a
+    # provider. Not checking is the safe failure.
+    min_amount: Optional[Decimal] = None
+    max_amount: Optional[Decimal] = None
+    limits_currency: Optional[str] = None
+
     website: str = ""
     notes: str = ""
 
     def supports(self, currency_from: str, currency_to: str) -> bool:
         """True when this provider operates on the given corridor."""
         send, receive = currency_from.upper(), currency_to.upper()
+
+        if send in {c.upper() for c in self.cannot_send_from}:
+            return False
+
         for rule_send, rule_receive in self.corridors:
             if rule_send not in (ANY, send):
                 continue
@@ -106,6 +150,30 @@ class ProviderMeta:
                 continue
             return True
         return False
+
+    def accepts_amount(
+        self, amount: Decimal, currency_from: str
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Whether this provider will move `amount`, and why not if it will not.
+
+        Returns (True, None) when the limits do not apply — either none are
+        declared, or they are denominated in a currency other than the one
+        being sent. Silence beats a guess: excluding a provider on a converted
+        limit we cannot compute would hide a real option.
+        """
+        if self.limits_currency and currency_from.upper() != self.limits_currency.upper():
+            return (True, None)
+
+        unit = self.limits_currency or currency_from.upper()
+
+        if self.min_amount is not None and amount < self.min_amount:
+            return (False, f"Minimum transfer is {_plain(self.min_amount)} {unit}")
+
+        if self.max_amount is not None and amount > self.max_amount:
+            return (False, f"Maximum transfer is {_plain(self.max_amount)} {unit}")
+
+        return (True, None)
 
     @property
     def missing_credentials(self) -> Tuple[str, ...]:
@@ -125,3 +193,11 @@ class ProviderMeta:
         one with monkeypatch.
         """
         return not self.missing_credentials
+
+
+def _plain(value: Decimal) -> str:
+    """Render a limit without scientific notation or trailing zeros."""
+    normalized = value.normalize()
+    if normalized == normalized.to_integral_value():
+        normalized = normalized.quantize(Decimal(1))
+    return format(normalized, "f")

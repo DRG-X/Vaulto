@@ -104,7 +104,7 @@ flint/
 │   │   ├── ranking.py          # Sort modes + filters
 │   │   ├── sanity.py           # Reject rates that cannot be right
 │   │   └── comparator.py       # Select, fetch, normalize, filter, rank
-│   └── tests/                  # 190 tests
+│   └── tests/                  # 258 tests
 │
 └── frontend/
     ├── next.config.js
@@ -387,7 +387,7 @@ outage should never end the comparison.
 cd backend && python -m pytest tests/ -q
 ```
 
-190 tests covering Decimal precision and rounding, ISO-4217 minor units,
+258 tests covering Decimal precision and rounding, ISO-4217 minor units,
 delivery parsing, fee-model re-basing, the five sort modes, the filters, and a
 full three-provider comparison.
 
@@ -422,54 +422,79 @@ Set env var: `NEXT_PUBLIC_API_URL=https://your-backend.railway.app`
 
 ## Providers
 
-Eighteen providers across both directions of the AUD ↔ INR corridor, covering
-every **Critical** and **High** priority row of the provider master list.
+**28 providers** — every row of the provider master list, across both
+directions of the AUD ↔ INR corridor. ("Wise India" is not separate: it is the
+Wise integration with the direction reversed.)
 
-### Send AUD (Australia → India)
+### Send AUD → INR (19 providers)
 
-| Provider | Priority | Integration | Notes |
-|---|---|---|---|
-| Wise | 1 | Public API | Quotes at mid-market; publishes the reference rate |
-| Remitly | 1 | Public API | Calculator API; base rate preferred over promo |
-| XE | 1 | Partner API | **Reference only** — see below |
-| Western Union | 2 | Public API | Uses the PRICECATALOG JSON, not a scrape |
-| OFX | 2 | Partner API | Fee-free above A$200 |
-| InstaReM | 2 | Partner API | Zero-fee model; cost is in the rate |
-| Airwallex | 2 | Partner API | Two-step auth, token cached |
-| Revolut | 2 | Partial API | Weekend surcharge modelled |
-| CommBank | 1 | Scrape | `avoid` — the gap Vaulto exists to show |
-| ANZ · Westpac | 2 | Scrape | `avoid` |
+| Provider | Pri | Integration | Limits | Notes |
+|---|---|---|---|---|
+| Wise | 1 | Public API | A$1–1M | Quotes at mid-market |
+| Remitly | 1 | Public API | A$10–30k | Base rate preferred over promo |
+| XE | 1 | Partner API | — | **Reference only** |
+| Western Union | 2 | Public API | A$1–50k | Uses the PRICECATALOG JSON |
+| OFX | 2 | Partner API | A$200+ | Fee-free above A$200 |
+| InstaReM | 2 | Partner API | A$1–500k | Zero-fee model |
+| Airwallex | 2 | Partner API | A$1+ | Two-step auth, token cached |
+| Revolut | 2 | Partial API | A$1+ | Weekend surcharge modelled |
+| CurrencyFair | 3 | Partner API | A$8–150k | P2P — **can beat mid-market** |
+| WorldRemit | 3 | Partner API | A$1–9k | UPI payout to India |
+| TorFX | 3 | Partner API | **A$2,000+** | Broker; endpoint via env |
+| Moneycorp | 4 | Partner API | **A$1,000+** | Broker; endpoint via env |
+| SingX | 4 | Partial API | A$200–500k | |
+| CommBank | 1 | Scrape | A$1+ | `avoid` |
+| ANZ · Westpac | 2 | Scrape | A$1+ | `avoid` |
+| NAB | 3 | Scrape | A$1+ | `avoid` |
+| MoneyGram | 3 | Scrape | A$1–10k | **JS calculator** |
+| Panda Remit | 3 | Scrape | A$10–50k | **JS calculator** |
 
-### Send INR (India → Australia)
+### Send INR → AUD (11 providers)
 
-| Provider | Priority | Integration | Notes |
-|---|---|---|---|
-| Wise | 1 | Public API | Same integration, direction reversed — "Wise India" needs no separate provider |
-| SBI | 1 | Scrape | `avoid` — where most parents start |
-| HDFC · ICICI | 2 | Scrape | `avoid` |
-| BookMyForex | 2 | Scrape | The realistic India-side benchmark |
-| ExTravelMoney | 2 | Scrape | |
-| HOP Remit | 2 | Scrape | **Benchmark only — never displayed** |
+| Provider | Pri | Integration | Limits | Notes |
+|---|---|---|---|---|
+| Wise | 1 | Public API | — | Same integration, reversed |
+| XE | 1 | Partner API | — | **Reference only** |
+| SBI | 1 | Scrape | ₹1,000+ | `avoid` |
+| HDFC · ICICI | 2 | Scrape | ₹1,000+ | `avoid` |
+| BookMyForex | 2 | Scrape | ₹1,000–15L | The realistic India-side benchmark |
+| ExTravelMoney | 2 | Scrape | ₹500–10L | |
+| HOP Remit | 2 | Scrape | ₹1,000+ | **Benchmark only — never displayed** |
+| Niyo Global | 3 | Partial API | ₹1,000+ | Popular with students |
+| Axis Forex | 3 | Scrape | ₹5,000+ | `avoid` |
+| Thomas Cook India | 3 | Scrape | ₹5,000–15L | |
 
-### Three things worth knowing
+### Five things worth knowing
 
-**XE is a reference, not a quote.** `xecdapi.xe.com` is XE's currency-data
-product: it returns the mid-market rate, not XE Money Transfer's retail
-pricing. Ranking it as a quote would show XE at a flat 0% markup and win every
-comparison at a price nobody can buy. It is wired in as the neutral mid-market
-reference instead — which is more valuable, since it removes the dependency on
-a competitor (Wise) being reachable for markup to be computable.
+**Transfer limits are enforced before any call.** Brokers offer their best
+rates precisely *because* they refuse small transfers — TorFX starts at
+A$2,000, Moneycorp at A$1,000. Without the floors, a student sending A$500
+would see TorFX win with a quote TorFX would decline. Limits are only applied
+when the send currency matches the currency they are denominated in; comparing
+A$2,000 to a rupee amount needs a rate we do not have at selection time, and a
+wrong conversion would hide a real option.
 
-**Providers are selected before they are called.** A provider that does not
-serve the corridor, or whose partner key is not configured, is never asked —
-it appears in `unavailable_providers` with a reason, not in `failed_providers`.
-"Does not serve AUD→INR", "needs an API key you have to apply for" and "it
-broke" are three different problems, and conflating them makes a healthy
-system look broken while hiding the provider that genuinely failed.
+**Only Wise can originate rupees.** Moving money *out* of India requires an RBI
+AD-II licence under the Liberalised Remittance Scheme. The global fintechs and
+brokers receive rupees; they do not send them. They are excluded from INR→AUD
+via `cannot_send_from`, so they are never called there rather than failing
+confusingly. Wise is the exception — it runs an Indian entity, which is what
+the sheet lists separately as "Wise India".
 
-**Banks are in the comparison on purpose.** They carry `avoid: true` and
-`category: "bank"` so the UI can show the gap rather than quietly ranking them
-last.
+**"USD 250,000 LRS" is not a per-transfer cap.** It is India's *annual*
+per-person allowance, denominated in a third currency. Modelling it as a
+maximum would wrongly exclude large legitimate transfers, so LRS-capped
+providers carry no `max_amount`.
+
+**XE is a reference, not a quote.** `xecdapi.xe.com` is XE's *currency-data*
+product: it returns mid-market, not XE Money Transfer's retail pricing.
+Ranking it as a quote would show a flat 0% markup and win every comparison at
+a price nobody can buy. As the neutral reference it is worth more — markup no
+longer depends on a competitor (Wise) being reachable.
+
+**CurrencyFair can legitimately beat mid-market.** It is peer-to-peer: a
+matched trade can settle better than interbank mid, giving a *negative*
+`fx_markup_pct`. That is real, not a parsing error, and is reported as-is.
 
 ---
 
@@ -479,6 +504,7 @@ Five providers need credentials you apply for. Without them they are skipped
 cleanly — nothing fails. Add to `backend/.env`:
 
 ```bash
+# Priority 1-2
 XE_ACCOUNT_ID=...          # xecdapi.xe.com — supplies the mid-market reference
 XE_API_KEY=...
 OFX_API_KEY=...            # ofx.com/en-au/business/api
@@ -486,15 +512,32 @@ INSTAREM_API_KEY=...       # partnerships@instarem.com
 AIRWALLEX_CLIENT_ID=...    # developer.airwallex.com
 AIRWALLEX_API_KEY=...
 REVOLUT_API_KEY=...        # developer.revolut.com
+
+# Priority 3-4
+CURRENCYFAIR_API_KEY=...   # help.currencyfair.com/api
+WORLDREMIT_API_KEY=...     # partnerships@worldremit.com
+SINGX_API_KEY=...          # singx.co
+MONEYCORP_API_KEY=...      # moneycorp.com/api
+
+# TorFX and Niyo Global publish no endpoint at all ("contact us"), so the URL
+# comes from your partner agreement. A hard-coded guess would 404 and read as
+# an outage rather than as "you have not been onboarded yet".
+TORFX_API_KEY=...
+TORFX_API_URL=...
+NIYO_API_KEY=...
+NIYO_API_URL=...
 ```
+
+Every provider above is skipped cleanly when its credentials are absent —
+nothing fails, and `unavailable_providers` says exactly what is missing.
 
 ---
 
 ## ⚠️ Verify before you deploy
 
-The fifteen providers added from the master list were written against
-published documentation and the usual shape of bank rate pages. **None could
-be tested against a live response** — the environment they were written in
+The 25 providers added from the master list were written against published
+documentation and the usual shape of bank rate pages. **None could be tested
+against a live response** — the environment they were written in
 blocks every provider host at the network policy level. The API field names
 and, especially, the HTML selectors in `providers/scrapers/sites.py` are
 informed guesses.
@@ -507,9 +550,17 @@ python -m scripts.verify_providers --corridor AUD:INR --amount 1000
 python -m scripts.verify_providers --corridor INR:AUD --amount 100000
 ```
 
-Each provider reports `OK`, `NO KEY`, `N/A` (wrong corridor — expected) or
-`BROKEN`. Exit status is non-zero if anything is broken, so it can gate a
-deploy.
+Each provider reports one of:
+
+| Status | Meaning |
+|---|---|
+| `OK` | A plausible quote came back — still spot-check the numbers |
+| `NO KEY` | Credentials not configured; nothing to test yet |
+| `N/A` | Does not serve this corridor or this amount (expected) |
+| `NEEDS JS` | Rate is behind a JavaScript calculator — needs its JSON endpoint or Playwright, **not** a selector fix |
+| `BROKEN` | Reached it and could not parse the answer — this is the one to fix |
+
+Exit status is non-zero if anything is `BROKEN`, so it can gate a deploy.
 
 A `BROKEN` scraper is almost always a selector: open the page, find the column
 that actually holds the telegraphic-transfer rate, and edit `sites.py`. That
@@ -532,21 +583,39 @@ meantime:
 
 ---
 
-## Adding a provider from the master list
+## Adding another provider
 
-The Medium and Low priority rows are mostly one entry each:
+Every row of the master list is already integrated. For anything new:
 
-* **Scrape-based** (NAB, MoneyGram, Thomas Cook, Axis Forex) — add a
-  `SiteConfig` row to `providers/scrapers/sites.py`. No code.
-* **API-based** (WorldRemit, CurrencyFair, TorFX, Moneycorp, Niyo, SingX) —
-  subclass `PartnerAPIProvider`, implement `_build_request` and `_parse`, and
-  register it in `providers/registry.py`.
+* **Scrape-based** — add a `SiteConfig` row to `providers/scrapers/sites.py`.
+  No code. Set `quotes_target_in_source=True` if the page prices one unit of
+  the receive currency in the send currency (the Indian rate-card convention),
+  and `requires_js=True` if the rate only appears after JavaScript runs.
+* **API-based** — subclass `PartnerAPIProvider`, implement `_build_request`
+  and `_parse`, and register it in `providers/registry.py`. Set `DEFAULT_URL`
+  if the endpoint is published and `URL_ENV` if it is not.
+
+Either way, fill in `ProviderMeta` honestly: the corridors it serves, the
+transfer band, whether it can originate the send currency, and its category.
+The registry uses all of it to decide whether the provider is worth calling.
 
 ---
 
 ## Limitations & Next Steps
 
-- **Mid-market reference depends on Wise.** FX markup and `total_cost` are
+- **Above A$1,000,000 there is no mid-market reference without XE.** Wise's
+  transfer ceiling is A$1M, so past it Wise is correctly excluded — and with
+  it goes the fallback reference, leaving only the banks and no markup
+  reported. Configuring `XE_ACCOUNT_ID` / `XE_API_KEY` fixes this completely:
+  a data feed has no transfer limit and is never excluded on amount. Left as
+  a documented gap rather than special-cased, since transfers of that size are
+  well outside the student-remittance corridor this is built for.
+- **MoneyGram and Panda Remit are registered but not fetched.** Their rates
+  live behind JavaScript calculators, so they are reported as unavailable with
+  what they need rather than being called on every comparison for a guaranteed
+  timeout. Finding the JSON endpoint their calculator calls — as the Western
+  Union provider does — turns either into a working API provider.
+- **Mid-market reference otherwise depends on Wise.** FX markup and `total_cost` are
   measured against the mid-market rate Wise publishes in its comparison
   payload. If that endpoint is unavailable or drops the field, markup comes
   back `null` for the whole comparison rather than being guessed. A dedicated

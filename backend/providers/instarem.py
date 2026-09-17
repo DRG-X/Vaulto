@@ -34,7 +34,12 @@ class InstaRemProvider(PartnerAPIProvider):
         category=Category.FINTECH,
         integration=Integration.PARTNER_API,
         priority=2,
+        # Receives rupees; cannot originate them (no RBI AD-II licence).
+        cannot_send_from=("INR",),
         credentials=("INSTAREM_API_KEY",),
+        min_amount=Decimal('1'),
+        max_amount=Decimal('500000'),
+        limits_currency="AUD",
         website="https://www.instarem.com/en-au",
         notes="Zero-fee model — cost is entirely in the rate.",
     )
