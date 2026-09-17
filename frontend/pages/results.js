@@ -16,19 +16,32 @@ const SORT_OPTIONS = [
   { key: "speed", label: "Fastest" },
 ];
 
+// Speed ordering uses the backend's numeric ETA (eta_max_minutes) when it is
+// present. The old fallback below matched words in the prose label, which
+// could only tell minutes from hours from days — it sorted "10-12 days" ahead
+// of "2-3 days" and treated a 1-day transfer the same as a 5-day one.
+function etaRank(quote) {
+  if (quote.eta_max_minutes != null) return quote.eta_max_minutes;
+  if (quote.eta_min_minutes != null) return quote.eta_min_minutes;
+
+  const t = quote.transfer_time;
+  if (!t) return Number.MAX_SAFE_INTEGER;
+  if (t.match(/min/i)) return 15;
+  if (t.match(/hour|hr/i)) return 60;
+  if (t.match(/day/i)) return 1440;
+  return Number.MAX_SAFE_INTEGER;
+}
+
 function sortResults(results, sortBy) {
   const r = [...results];
   if (sortBy === "rate") return r.sort((a, b) => b.receive_amount - a.receive_amount);
   if (sortBy === "fee") return r.sort((a, b) => a.fee - b.fee);
   if (sortBy === "speed") {
-    const order = (t) => {
-      if (!t) return 99;
-      if (t.match(/min/i)) return 0;
-      if (t.match(/hour|hr/i)) return 1;
-      if (t.match(/day/i)) return 2;
-      return 3;
-    };
-    return r.sort((a, b) => order(a.transfer_time) - order(b.transfer_time));
+    // Break ties on money received, so two equally fast providers do not get
+    // ordered arbitrarily.
+    return r.sort(
+      (a, b) => etaRank(a) - etaRank(b) || b.receive_amount - a.receive_amount
+    );
   }
   return r;
 }

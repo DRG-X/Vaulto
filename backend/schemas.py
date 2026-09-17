@@ -1,11 +1,24 @@
 from pydantic import BaseModel, field_validator
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
+from enum import Enum
 
 
 # ── Provider / Compare schemas ────────────────────────────────────────────────
 
 class ProviderQuote(BaseModel):
+    """
+    One provider's quote, normalized onto a comparable basis.
+
+    The first block is the original contract and is unchanged, so existing
+    clients keep working. Everything after it is additive.
+
+    `send_amount` is what LEAVES THE SENDER'S ACCOUNT — fee included. Every
+    provider is reported on that one basis, which is what makes
+    `receive_amount` comparable across providers at all (see
+    engine/normalize.py).
+    """
+
     provider: str
     send_amount: float
     fee: float
@@ -16,11 +29,89 @@ class ProviderQuote(BaseModel):
     transfer_time: str
     error: Optional[str] = None
 
+    # ── Exact values ──────────────────────────────────────────────────────
+    # Floats are fine for display but lose digits on rates like 83.4210000001.
+    # These carry the full-precision decimal as a string, so a client that
+    # cares (or a stored comparison replayed later) never inherits our
+    # float rounding.
+    exchange_rate_exact: Optional[str] = None
+    receive_amount_exact: Optional[str] = None
+
+    # ── Delivery speed ────────────────────────────────────────────────────
+    # Numeric, so speed can be ranked and filtered instead of regex-matched.
+    eta_min_minutes: Optional[int] = None
+    eta_max_minutes: Optional[int] = None
+    eta_is_business_days: bool = False
+
+    # ── True cost ─────────────────────────────────────────────────────────
+    # A provider advertising "zero fees" usually recovers it in the exchange
+    # rate. Total cost = the visible fee PLUS the hidden FX markup, which is
+    # the only number that actually ranks providers honestly.
+    mid_market_rate: Optional[float] = None
+    fx_markup_pct: Optional[float] = None
+    fx_markup_cost: Optional[float] = None
+    total_cost: Optional[float] = None
+    total_cost_pct: Optional[float] = None
+
+    # ── Provenance ────────────────────────────────────────────────────────
+    fee_model: Optional[str] = None            # "deducted" | "added"
+    principal_amount: Optional[float] = None   # amount actually converted
+    normalized: bool = False                   # basis was adjusted to compare
+    pay_in_method: Optional[str] = None
+    pay_out_method: Optional[str] = None
+    service_name: Optional[str] = None
+    is_promotional: bool = False
+    rate_type: Optional[str] = None            # "base" | "promotional"
+
+
+class SortMode(str, Enum):
+    """
+    The filters a user actually chooses between, the way Monito frames them.
+
+    CHEAPEST is the honest default: it maximises what the recipient gets,
+    which already accounts for fee and rate together. The others exist
+    because "best" is genuinely personal — someone sending rent money cares
+    about FASTEST, someone moving savings cares about BEST_RATE.
+    """
+
+    CHEAPEST = "cheapest"       # most money in the recipient's hands
+    FASTEST = "fastest"         # earliest arrival
+    LOWEST_FEE = "lowest_fee"   # smallest upfront fee
+    BEST_RATE = "best_rate"     # smallest FX markup over mid-market
+    BEST_VALUE = "best_value"   # blended cost-and-speed score
+
 
 class CompareRequest(BaseModel):
     amount: float
     currency_from: str
     currency_to: str
+
+    # ── Filters (all optional; defaults reproduce the old behaviour) ──────
+    sort_by: SortMode = SortMode.CHEAPEST
+
+    #: Drop quotes that cannot arrive within this many minutes.
+    max_eta_minutes: Optional[int] = None
+
+    #: Restrict to a funding method ("DEBIT", "BANK", ...) or a payout rail
+    #: ("BANK_DEPOSIT", "CASH_PICKUP", ...). Case-insensitive.
+    pay_in_method: Optional[str] = None
+    pay_out_method: Optional[str] = None
+
+    #: Promotional first-transfer rates are real, but not repeatable. Callers
+    #: comparing ongoing cost should turn them off.
+    include_promo: bool = True
+
+    @field_validator("pay_in_method", "pay_out_method")
+    @classmethod
+    def normalize_method(cls, v):
+        return v.strip().upper() if isinstance(v, str) and v.strip() else None
+
+    @field_validator("max_eta_minutes")
+    @classmethod
+    def eta_must_be_positive(cls, v):
+        if v is not None and v <= 0:
+            raise ValueError("max_eta_minutes must be positive")
+        return v
 
     @field_validator("amount")
     @classmethod
@@ -36,12 +127,38 @@ class CompareRequest(BaseModel):
 
 
 class CompareResponse(BaseModel):
+    """
+    A ranked comparison.
+
+    `quotes` holds only usable quotes, ordered by the requested `sort_by`.
+    Providers that errored are named in `failed_providers` and detailed in
+    `errors` — they are NOT mixed into `quotes`, because a failed provider
+    used to enter the ranking with receive_amount 0.0 and drag every savings
+    figure toward nonsense.
+    """
+
     best_provider: ProviderQuote
     quotes: List[ProviderQuote]
     savings_vs_worst: float
     savings_vs_average: float
     request: CompareRequest
     failed_providers: List[str]
+
+    # ── Additive ──────────────────────────────────────────────────────────
+    #: Winner under each sort mode, as {mode: provider_name}. Lets the UI
+    #: label "cheapest" and "fastest" without re-running the comparison.
+    best_by: Dict[str, str] = {}
+
+    #: Reference mid-market rate used for markup maths, when one was found.
+    mid_market_rate: Optional[float] = None
+    mid_market_rate_exact: Optional[str] = None
+    mid_market_source: Optional[str] = None
+
+    #: Full detail for providers that could not quote.
+    errors: List[ProviderQuote] = []
+
+    #: Quotes dropped by the request's filters (not failures).
+    filtered_out: List[str] = []
 
 
 # ── User schemas ──────────────────────────────────────────────────────────────

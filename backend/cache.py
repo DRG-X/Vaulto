@@ -19,6 +19,7 @@ Key design decisions
 import json
 import logging
 import os
+from decimal import Decimal, InvalidOperation
 
 import redis.asyncio as aioredis
 from redis.exceptions import RedisError
@@ -120,15 +121,46 @@ async def close_cache() -> None:
 # Cache key
 # ---------------------------------------------------------------------------
 
-def _cache_key(from_currency: str, to_currency: str, amount: float) -> str:
+def _cache_key(
+    from_currency: str,
+    to_currency: str,
+    amount: float,
+    variant: str = "",
+) -> str:
     """
-    Build a stable cache key.
+    Build a stable cache key that is EXACT in the amount.
 
-    Amount is bucketed to the nearest 50 so that 480 and 510 share the same
-    cached result — rates don't change meaningfully over small amount ranges.
+    This used to bucket the amount to the nearest 50, so a request for 1000
+    was served a comparison computed for 1025. That is not a caching
+    approximation, it is a wrong answer: every quote in the payload carries
+    `send_amount`, `fee` and `receive_amount` for the bucketed figure, and the
+    user sees numbers that do not correspond to what they typed.
+
+    The bucketing assumption — "rates don't change meaningfully over small
+    amount ranges" — is also false in the place it matters most. Provider fees
+    are TIERED and their rates are amount-banded, so a bucket boundary is
+    exactly where the fee jumps. Bucketing smeared those discontinuities and
+    produced errors far larger than the rounding this work set out to fix.
+
+    Amounts are normalized through Decimal so that 1000, 1000.0 and "1000.00"
+    share one key without any of them being rounded to a different value.
+
+    `variant` namespaces entries whose stored SHAPE differs for the same
+    corridor and amount. Callers do not need it for filters or sort modes:
+    what is cached is the provider data, which those do not affect (see
+    `get_rates` in main.py). It exists so a second kind of payload can share
+    this cache without colliding with the first.
     """
-    bucket = round(amount / 50) * 50
-    return f"rates:v1:{from_currency.upper()}:{to_currency.upper()}:{bucket}"
+    try:
+        exact = Decimal(str(amount)).normalize()
+        # normalize() renders 1000 as 1E+3; expand it so keys stay readable
+        # and, more importantly, stable across equivalent inputs.
+        amount_part = format(exact.quantize(Decimal(1)) if exact == exact.to_integral_value() else exact, "f")
+    except (InvalidOperation, ValueError):
+        amount_part = str(amount)
+
+    suffix = f":{variant}" if variant else ""
+    return f"rates:v2:{from_currency.upper()}:{to_currency.upper()}:{amount_part}{suffix}"
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +171,7 @@ async def get_cached_rates(
     from_currency: str,
     to_currency: str,
     amount: float,
+    variant: str = "",
 ) -> dict | None:
     """
     Return the cached rate dict for this corridor/amount, or None on miss.
@@ -155,7 +188,7 @@ async def get_cached_rates(
         logger.info("CACHE STEP: _client is None — skipping cache lookup")
         return None
 
-    key = _cache_key(from_currency, to_currency, amount)
+    key = _cache_key(from_currency, to_currency, amount, variant)
     logger.info("CACHE STEP: cache key=%s", key)
 
     try:
@@ -182,6 +215,7 @@ async def set_cached_rates(
     to_currency: str,
     amount: float,
     data: dict,
+    variant: str = "",
 ) -> None:
     """
     Write the rate dict to Redis with CACHE_TTL expiry.
@@ -197,7 +231,7 @@ async def set_cached_rates(
         logger.info("CACHE STEP: _client is None — skipping cache write")
         return
 
-    key = _cache_key(from_currency, to_currency, amount)
+    key = _cache_key(from_currency, to_currency, amount, variant)
     logger.info("CACHE STEP: attempting SETEX key=%s  ttl=%d", key, CACHE_TTL)
     try:
         payload = json.dumps(data)
