@@ -52,7 +52,6 @@ export default function AlertModal({
   // stale silently and omits providers the engine is already comparing.
   const [providers, setProviders]     = useState([]);
   const [notifyEmail, setNotifyEmail] = useState(editAlert?.notify_email ?? true);
-  const [notifyWA, setNotifyWA]       = useState(editAlert?.notify_whatsapp ?? false);
   const [loading, setLoading]         = useState(false);
   const [error, setError]             = useState("");
 
@@ -66,7 +65,6 @@ export default function AlertModal({
       setProvider(editAlert?.provider || "");
       setPayOut(editAlert?.pay_out_method || "");
       setNotifyEmail(editAlert?.notify_email ?? true);
-      setNotifyWA(editAlert?.notify_whatsapp ?? false);
       setError("");
     }
   }, [isOpen, editAlert]);
@@ -126,6 +124,7 @@ export default function AlertModal({
     if (from === to) return setError("From and To currencies must be different.");
     if (!parsedAmount || parsedAmount <= 0) return setError("Enter a valid amount.");
     if (!parsedRate || parsedRate <= 0) return setError("Enter a valid target rate.");
+    if (!notifyEmail) return setError("Email notification is required — it is the only delivery channel available right now.");
 
     const payload = {
       from_currency:   from,
@@ -135,7 +134,7 @@ export default function AlertModal({
       provider:        provider || null,
       pay_out_method:  payOut || null,
       notify_email:    notifyEmail,
-      notify_whatsapp: notifyWA && !!userWhatsapp,
+      notify_whatsapp: false,
     };
 
     setLoading(true);
@@ -260,13 +259,13 @@ export default function AlertModal({
                 <span>Notify by Email</span>
               </label>
               {userWhatsapp && (
-                <label className="toggle-row">
-                  <input
-                    type="checkbox"
-                    checked={notifyWA}
-                    onChange={(e) => setNotifyWA(e.target.checked)}
-                  />
-                  <span>Notify by WhatsApp ({userWhatsapp})</span>
+                /* Disabled until there is something behind it. The backend
+                   stores notify_whatsapp but nothing delivers it, so an alert
+                   relying on it fires and notifies nobody. Offering a channel
+                   that silently drops messages is worse than not offering it. */
+                <label className="toggle-row toggle-row--disabled">
+                  <input type="checkbox" checked={false} disabled readOnly />
+                  <span>Notify by WhatsApp ({userWhatsapp}) — coming soon</span>
                 </label>
               )}
             </div>
@@ -331,6 +330,7 @@ export default function AlertModal({
           font-size: 0.85rem; color: var(--text); cursor: pointer;
         }
         .toggle-row input[type="checkbox"] { accent-color: var(--spark); width: 15px; height: 15px; }
+        .toggle-row--disabled { color: var(--muted); cursor: not-allowed; }
         .modal-footer {
           display: flex; gap: 0.75rem; justify-content: flex-end;
           padding: 1rem 1.5rem;

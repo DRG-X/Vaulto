@@ -12,4 +12,6 @@ redis==5.0.3
 hiredis==2.3.2
 slowapi==0.1.9
 APScheduler==3.10.4
-resend==0.7.2
+# Email (rate alerts) goes through Resend's REST API over httpx — see
+# notifications.py. The `resend` SDK is deliberately NOT used: its send is
+# a blocking call, and the alert checker shares the API server's event loop.
