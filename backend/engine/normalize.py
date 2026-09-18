@@ -67,6 +67,7 @@ from money import (
     to_str,
 )
 from providers.quote import RawQuote
+from providers.rails import canonical_pay_in, canonical_pay_out
 from schemas import ProviderQuote
 
 
@@ -145,8 +146,9 @@ def normalize_quote(
     transfer_time = delivery.humanize(
         raw.eta_min_minutes, raw.eta_max_minutes, raw.eta_is_business_days
     )
-    if raw.pay_out_method:
-        transfer_time = f"{transfer_time} ({_label(raw.pay_out_method)})"
+    canonical_out = canonical_pay_out(raw.pay_out_method)
+    if canonical_out:
+        transfer_time = f"{transfer_time} ({_label(canonical_out)})"
 
     return ProviderQuote(
         provider=raw.provider,
@@ -174,8 +176,11 @@ def normalize_quote(
         fee_model=raw.fee_model.value,
         principal_amount=to_float(principal),
         normalized=normalized,
-        pay_in_method=raw.pay_in_method,
-        pay_out_method=raw.pay_out_method,
+        # Canonicalized here, once, so a filter for "bank deposit" matches
+        # every provider that offers one rather than only those that spell it
+        # the same way we do — see providers/rails.py.
+        pay_in_method=canonical_pay_in(raw.pay_in_method),
+        pay_out_method=canonical_pay_out(raw.pay_out_method),
         service_name=raw.service_name,
         is_promotional=raw.is_promotional,
         rate_type=raw.rate_type,

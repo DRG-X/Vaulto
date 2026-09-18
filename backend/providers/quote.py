@@ -106,9 +106,16 @@ class RawQuote:
 
     @property
     def ok(self) -> bool:
-        """True when this quote carries usable numbers."""
-        return (
-            self.error is None
-            and self.exchange_rate > 0
-            and self.principal > 0
-        )
+        """
+        True when this quote carries usable numbers.
+
+        A reference-only source supplies a rate and nothing else — it has no
+        principal because it is not selling a transfer. Requiring one made
+        every successful XE fetch log "no usable quote", which is the opposite
+        of what happened.
+        """
+        if self.error is not None or self.exchange_rate <= 0:
+            return False
+        if self.reference_only:
+            return True
+        return self.principal > 0

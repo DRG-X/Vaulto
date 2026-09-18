@@ -35,6 +35,23 @@ logger = logging.getLogger(__name__)
 MIN_PLAUSIBLE_RATE = Decimal("0.000001")
 MAX_PLAUSIBLE_RATE = Decimal("100000")
 
+
+class Ambiguous:
+    """
+    Sentinel: a matching row was found but its rate could not be identified.
+
+    Distinct from None ("nothing here"), because the two demand opposite
+    responses. `None` means keep looking; AMBIGUOUS means STOP — we already
+    saw the data and deliberately declined to guess which column it was in,
+    and a later, looser strategy would just reinstate the guess we refused.
+    """
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return "AMBIGUOUS"
+
+
+AMBIGUOUS = Ambiguous()
+
 #: Digits, thousands commas, optional decimal part. Whitespace is NOT allowed
 #: inside a number: with `\s` in the class, "1 57.50" (a unit column beside a
 #: rate column, flattened into one string) parses as 157.50 — a plausible
@@ -59,7 +76,9 @@ def parse_number(text: str) -> Optional[Decimal]:
     return value if value.is_finite() else None
 
 
-def is_plausible_rate(value: Optional[Decimal]) -> bool:
+def is_plausible_rate(value) -> bool:
+    if not isinstance(value, Decimal):
+        return False
     return (
         value is not None
         and value.is_finite()
@@ -193,7 +212,7 @@ def from_table(
                     "column header — refusing to guess; fix column_hints in sites.py",
                     currency_code, len(distinct), sorted(distinct),
                 )
-                return None
+                return AMBIGUOUS
 
     return None
 
@@ -254,17 +273,35 @@ def extract_rate(
     currency_names: Sequence[str] = (),
     column_hints: Sequence[str] = (),
 ) -> Optional[Decimal]:
-    """Try each strategy in order of reliability; None when all fail."""
-    for strategy, args in (
-        (from_table, (html, currency_code, currency_names, column_hints)),
-        (from_labelled_value, (html, currency_code, currency_names)),
-    ):
-        try:
-            value = strategy(*args)
-        except Exception:
-            logger.exception("scrape strategy %s raised", strategy.__name__)
-            continue
-        if is_plausible_rate(value):
-            logger.info("scrape: %s found %s via %s", currency_code, value, strategy.__name__)
-            return value
+    """
+    Try each strategy in order of reliability; None when all fail.
+
+    A REFUSAL is not a failure to be retried. When the table strategy finds
+    the currency's row but cannot tell which column holds the rate, falling
+    through to the looser text scan would reinstate exactly the guess the
+    table strategy declined to make — and the wrong column (cash instead of
+    telegraphic-transfer) is only a few percent off, so it sails straight
+    through the sanity band and is reported as a real price.
+    """
+    try:
+        value = from_table(html, currency_code, currency_names, column_hints)
+    except Exception:
+        logger.exception("scrape strategy from_table raised")
+        value = None
+
+    if value is AMBIGUOUS:
+        return None
+    if is_plausible_rate(value):
+        logger.info("scrape: %s found %s via from_table", currency_code, value)
+        return value
+
+    try:
+        value = from_labelled_value(html, currency_code, currency_names)
+    except Exception:
+        logger.exception("scrape strategy from_labelled_value raised")
+        return None
+
+    if is_plausible_rate(value):
+        logger.info("scrape: %s found %s via from_labelled_value", currency_code, value)
+        return value
     return None

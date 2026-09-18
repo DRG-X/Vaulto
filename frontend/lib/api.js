@@ -42,13 +42,57 @@ export async function createUserProfile(token, data) {
   return handleResponse(res);
 }
 
-// ── Compare (legacy — used by index.js) ───────────────────────────────────────
+// ── Compare ────────────────────────────────────────────────────────────────────
 
-export async function compareProviders({ amount, currency_from, currency_to }) {
+/**
+ * Sort modes the backend understands. `cheapest` maximises what the recipient
+ * receives and is the honest default; the others exist because "best" is
+ * genuinely personal — rent money wants `fastest`, savings want `best_rate`.
+ */
+export const SORT_MODES = {
+  CHEAPEST: "cheapest",
+  FASTEST: "fastest",
+  LOWEST_FEE: "lowest_fee",
+  BEST_RATE: "best_rate",
+  BEST_VALUE: "best_value",
+};
+
+/**
+ * Build the filter half of a comparison request.
+ *
+ * Only non-default values are sent. That keeps URLs and cache keys clean, and
+ * means a request with no filters is byte-identical to the one the backend
+ * treats as the default.
+ */
+function filterParams({ sortBy, maxEtaMinutes, payInMethod, payOutMethod, includePromo } = {}) {
+  const out = {};
+  if (sortBy && sortBy !== SORT_MODES.CHEAPEST) out.sort_by = sortBy;
+  if (maxEtaMinutes) out.max_eta_minutes = String(maxEtaMinutes);
+  if (payInMethod) out.pay_in_method = payInMethod;
+  if (payOutMethod) out.pay_out_method = payOutMethod;
+  if (includePromo === false) out.include_promo = "false";
+  return out;
+}
+
+export async function compareProviders({
+  amount, currency_from, currency_to,
+  sortBy, maxEtaMinutes, payInMethod, payOutMethod, includePromo,
+}) {
+  const body = {
+    amount: parseFloat(amount),
+    currency_from,
+    currency_to,
+  };
+  if (sortBy) body.sort_by = sortBy;
+  if (maxEtaMinutes) body.max_eta_minutes = Number(maxEtaMinutes);
+  if (payInMethod) body.pay_in_method = payInMethod;
+  if (payOutMethod) body.pay_out_method = payOutMethod;
+  if (includePromo === false) body.include_promo = false;
+
   const res = await fetch(`${API_URL}/compare`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ amount: parseFloat(amount), currency_from, currency_to }),
+    body: JSON.stringify(body),
   });
   return handleResponse(res);
 }
@@ -96,8 +140,26 @@ export async function completeOnboarding(token, data) {
 
 // ── /api/rates ─────────────────────────────────────────────────────────────────
 
-export async function getRates({ from, to, amount }) {
-  const params = new URLSearchParams({ from, to, amount: String(amount) });
+/**
+ * Live comparison for a corridor.
+ *
+ * Sorting and filtering happen on the SERVER, not here. That is not just tidier
+ * — the backend picks which of a provider's pay-in/pay-out options to show
+ * based on the active filter, so a speed filter switches Western Union to its
+ * minutes-settled rail instead of dropping it. Re-sorting the returned rows in
+ * the browser cannot do that, and would silently disagree with the "Fastest"
+ * badge the backend computed.
+ */
+export async function getRates({
+  from, to, amount,
+  sortBy, maxEtaMinutes, payInMethod, payOutMethod, includePromo,
+} = {}) {
+  const params = new URLSearchParams({
+    from,
+    to,
+    amount: String(amount),
+    ...filterParams({ sortBy, maxEtaMinutes, payInMethod, payOutMethod, includePromo }),
+  });
   const res = await fetch(`${API_URL}/api/rates?${params}`);
   return handleResponse(res);
 }

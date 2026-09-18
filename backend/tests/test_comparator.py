@@ -115,7 +115,8 @@ class TestFilters:
         result = await compare(req(max_eta_minutes=60))
         wise = next(q for q in result.quotes if q.provider == "Wise")
         assert wise.eta_max_minutes == 30          # the card row, not the bank row
-        assert wise.pay_in_method == "DEBIT_CARD"
+        # Canonical, not Wise's own "DEBIT_CARD" — see providers/rails.py.
+        assert wise.pay_in_method == "DEBIT"
 
     @pytest.mark.asyncio
     async def test_payout_filter_narrows_to_one_rail(self, live_providers):

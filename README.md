@@ -104,7 +104,7 @@ flint/
 │   │   ├── ranking.py          # Sort modes + filters
 │   │   ├── sanity.py           # Reject rates that cannot be right
 │   │   └── comparator.py       # Select, fetch, normalize, filter, rank
-│   └── tests/                  # 258 tests
+│   └── tests/                  # 287 tests
 │
 └── frontend/
     ├── next.config.js
@@ -387,7 +387,7 @@ outage should never end the comparison.
 cd backend && python -m pytest tests/ -q
 ```
 
-258 tests covering Decimal precision and rounding, ISO-4217 minor units,
+287 tests covering Decimal precision and rounding, ISO-4217 minor units,
 delivery parsing, fee-model re-basing, the five sort modes, the filters, and a
 full three-provider comparison.
 
@@ -495,6 +495,61 @@ longer depends on a competitor (Wise) being reachable.
 **CurrencyFair can legitimately beat mid-market.** It is peer-to-peer: a
 matched trade can settle better than interbank mid, giving a *negative*
 `fx_markup_pct`. That is real, not a parsing error, and is reported as-is.
+
+---
+
+## Frontend
+
+The comparison UI reads every field the engine produces. Four decisions shape it.
+
+**True cost is the headline, not the fee.** Each provider card leads with a
+two-part bar: the upfront fee in blue, the markup hidden in the exchange rate
+in amber. A bank advertising A$0 and taking 1.6% in the rate reads as what it
+is. The pair was validated for colour-vision separation against the card
+surface (ΔE 26.3 protan, 32.0 normal) and both segments are direct-labelled,
+so the reading never rests on colour alone.
+
+**Sorting and filtering happen on the server.** Changing sort re-queries rather
+than reordering rows in place, because the backend picks *which of a
+provider's rails to quote* per mode — asking for "fastest" switches Remitly
+from bank deposit (3–5 days) to UPI (minutes), and "lowest fee" switches
+Western Union to its A$0 bank row. Re-sorting in the browser cannot do that,
+and would disagree with the badges the backend computed.
+
+**The banks show real quotes.** The results page used to render a hardcoded
+panel of invented figures ("Rate: ~52–54 INR per AUD (estimated)"). Those are
+gone. Banks are live quotes on the same fee-inclusive basis as everything
+else, carrying the backend's own `avoid` flag, collapsed behind a toggle that
+names the actual gap.
+
+**"Not shown" is three different things.** Providers that don't serve the
+corridor, need an API key, or fall outside their transfer limits appear under
+"N more providers not shown" with the real reason. Providers your filter
+excluded are listed separately. Only genuine failures are surfaced as errors.
+Collapsing those into one "couldn't fetch rates" list makes a healthy system
+look broken and buries the one provider that really did fail.
+
+### Where things live
+
+```
+frontend/
+├── lib/
+│   ├── api.js            # Filter params; SORT_MODES
+│   ├── format.js         # Money at real currency precision, ETA, rails, cost split
+│   └── providerMeta.js   # Outbound links, icons, category colours for all 28
+├── components/
+│   ├── CostBar.js        # Fee vs hidden markup, the headline
+│   ├── ProviderCard.js   # One quote, with a detail drawer of exact values
+│   ├── SortBar.js        # Five modes, each naming its winner up front
+│   ├── FilterPanel.js    # Speed, payout rail, funding rail, promos
+│   └── ProviderStatus.js # Unavailable / filtered / failed, kept distinct
+└── pages/results.js      # Server-side sort + filters in the URL
+```
+
+A null field renders as "—", never as zero. `fx_markup_pct: null` means no
+mid-market reference was available, which is a different statement from "0%
+markup" — and printing 0% would flatter whichever provider happened to be
+listed.
 
 ---
 

@@ -5,6 +5,7 @@ import Link from "next/link";
 import Nav from "../components/Nav";
 import Footer from "../components/Footer";
 import { getRates } from "../lib/api";
+import { money, rate, eta } from "../lib/format";
 import { CURRENCIES } from "../lib/currencies";
 
 const fmt = (n, dec = 2) =>
@@ -53,9 +54,9 @@ export default function Send() {
     }
   };
 
-  const sortedResults = rateData?.results
-    ? [...rateData.results.filter(r => !r.error)].sort((a, b) => b.receive_amount - a.receive_amount)
-    : [];
+  // Already ranked by the backend (cheapest first) with failed providers
+  // excluded — re-sorting here would disagree with the rails it chose.
+  const sortedResults = rateData?.results || [];
 
   const fromCcy = CURRENCIES.find(c => c.code === formFrom);
   const toCcy = CURRENCIES.find(c => c.code === formTo);
@@ -130,12 +131,26 @@ export default function Send() {
                       <div className="sp-rank">{i + 1}</div>
                       <div>
                         <div className="sp-name">{r.provider}</div>
-                        {i === 0 && <span className="pill pill-secondary" style={{ fontSize: "0.65rem" }}>⭐ Best rate</span>}
+                        <div style={{ display: "flex", gap: "0.3rem", flexWrap: "wrap", marginTop: "0.2rem" }}>
+                          {i === 0 && <span className="pill pill-secondary" style={{ fontSize: "0.65rem" }}>⭐ Best value</span>}
+                          {r.avoid && (
+                            <span className="pill" style={{ fontSize: "0.65rem", color: "var(--error)", background: "var(--error-surface)" }}>
+                              ⚠ Expensive
+                            </span>
+                          )}
+                        </div>
                       </div>
                     </div>
                     <div className="sp-right">
-                      <div className="sp-receive">{fmt(r.receive_amount)} <span style={{ fontSize: "0.6em", opacity: 0.7 }}>{r.currency_to}</span></div>
-                      <div style={{ fontSize: "0.75rem", color: "var(--muted)" }}>Rate: {fmt(r.exchange_rate, 4)} · Fee: {fmt(r.fee)}</div>
+                      <div className="sp-receive">{money(r.receive_amount, r.currency_to)} <span style={{ fontSize: "0.6em", opacity: 0.7 }}>{r.currency_to}</span></div>
+                      <div style={{ fontSize: "0.75rem", color: "var(--muted)" }}>
+                        {/* True cost, not just the fee — a zero-fee provider
+                            can still be the expensive one. */}
+                        {r.total_cost != null
+                          ? `True cost: ${money(r.total_cost, r.currency_from)} ${r.currency_from}`
+                          : `Fee: ${money(r.fee, r.currency_from)} ${r.currency_from}`}
+                        {" · "}{eta(r)}
+                      </div>
                     </div>
                     <div style={{ fontSize: "0.8rem", color: "var(--secondary)", fontWeight: 600 }}>Select →</div>
                   </div>
@@ -153,7 +168,8 @@ export default function Send() {
                 Ready to send with {chosen.provider}
               </h2>
               <p style={{ color: "var(--muted)", marginBottom: "1.5rem" }}>
-                Recipient gets <strong style={{ color: "var(--tertiary)" }}>{fmt(chosen.receive_amount)} {chosen.currency_to}</strong> at a rate of {fmt(chosen.exchange_rate, 4)}.
+                Recipient gets <strong style={{ color: "var(--tertiary)" }}>{money(chosen.receive_amount, chosen.currency_to)} {chosen.currency_to}</strong> at a rate of {rate(chosen.exchange_rate)}
+                {chosen.total_cost != null && <> — costing {money(chosen.total_cost, chosen.currency_from)} {chosen.currency_from} all in</>}.
               </p>
               <a href={PROVIDER_URLS[chosen.provider] || "#"} target="_blank" rel="noopener noreferrer" className="btn-secondary" style={{ display: "inline-flex", margin: "0 auto" }} id="send-provider-cta">
                 Continue on {chosen.provider} ↗

@@ -5,6 +5,7 @@ import Link from "next/link";
 import Nav from "../components/Nav";
 import Footer from "../components/Footer";
 import { getRates } from "../lib/api";
+import { money, rate, eta } from "../lib/format";
 import { CURRENCIES } from "../lib/currencies";
 
 const fmt = (n, dec = 2) =>
@@ -225,13 +226,18 @@ export default function Home() {
                       {i === 0 ? "↑ +0.42%" : "↓ -0.18%"}
                     </span>
                   </div>
-                  <div className="market-rate">{fmt(r.exchange_rate, 4)}</div>
+                  <div className="market-rate">{rate(r.exchange_rate)}</div>
                   <div className="market-meta">
-                    <span>Fee: {r.currency_from} {fmt(r.fee)}</span>
-                    <span>{r.transfer_time}</span>
+                    <span>
+                      {/* True cost where the backend could compute it. */}
+                      {r.total_cost != null
+                        ? `Costs ${r.currency_from} ${money(r.total_cost, r.currency_from)}`
+                        : `Fee: ${r.currency_from} ${money(r.fee, r.currency_from)}`}
+                    </span>
+                    <span>{eta(r)}</span>
                   </div>
                   <div className="market-receive">
-                    {fmt(r.receive_amount)} <span style={{ fontSize: "0.7em", opacity: 0.6 }}>{r.currency_to}</span>
+                    {money(r.receive_amount, r.currency_to)} <span style={{ fontSize: "0.7em", opacity: 0.6 }}>{r.currency_to}</span>
                   </div>
                 </div>
               ))

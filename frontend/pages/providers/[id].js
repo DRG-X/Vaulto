@@ -4,6 +4,7 @@ import Link from "next/link";
 import Nav from "../../components/Nav";
 import Footer from "../../components/Footer";
 import { getRates } from "../../lib/api";
+import { money, rate, eta } from "../../lib/format";
 
 const PROVIDER_DATA = {
   wise: {
@@ -119,12 +120,19 @@ export default function ProviderDetail({ id }) {
             ) : liveResult ? (
               <div>
                 <div style={{ fontFamily: "var(--font-display)", fontSize: "2.5rem", fontWeight: 800, color: "var(--tertiary)", letterSpacing: "-0.03em" }}>
-                  {fmt(liveResult.receive_amount)} <span style={{ fontSize: "1rem", color: "var(--muted)" }}>INR</span>
+                  {money(liveResult.receive_amount, liveResult.currency_to)} <span style={{ fontSize: "1rem", color: "var(--muted)" }}>{liveResult.currency_to}</span>
                 </div>
                 <div style={{ display: "flex", gap: "1.5rem", marginTop: "0.75rem", flexWrap: "wrap" }}>
-                  <div><span className="label-sm">Exchange Rate</span><br /><strong>{fmt(liveResult.exchange_rate, 4)}</strong></div>
-                  <div><span className="label-sm">Fee</span><br /><strong>GBP {fmt(liveResult.fee)}</strong></div>
-                  <div><span className="label-sm">Delivery</span><br /><strong>{liveResult.transfer_time}</strong></div>
+                  <div><span className="label-sm">Exchange Rate</span><br /><strong>{rate(liveResult.exchange_rate)}</strong></div>
+                  <div><span className="label-sm">Upfront fee</span><br /><strong>{liveResult.currency_from} {money(liveResult.fee, liveResult.currency_from)}</strong></div>
+                  {liveResult.total_cost != null && (
+                    <div>
+                      {/* Fee plus the markup buried in the rate. */}
+                      <span className="label-sm">True cost</span><br />
+                      <strong>{liveResult.currency_from} {money(liveResult.total_cost, liveResult.currency_from)}</strong>
+                    </div>
+                  )}
+                  <div><span className="label-sm">Delivery</span><br /><strong>{eta(liveResult)}</strong></div>
                 </div>
               </div>
             ) : (

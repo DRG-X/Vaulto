@@ -351,3 +351,28 @@ class TestAirwallexConcurrency:
         assert raw.ok is False
         assert "auth failed" in raw.error
         assert provider._token is None
+
+
+class TestReferenceQuoteIsNotMistakenForAFailure:
+    @pytest.mark.asyncio
+    async def test_a_successful_reference_fetch_reports_ok(self, monkeypatch):
+        """
+        A reference source has no principal — it is not selling a transfer.
+        Requiring one made every successful XE fetch log "no usable quote".
+        """
+        monkeypatch.setenv("XE_ACCOUNT_ID", "acct")
+        monkeypatch.setenv("XE_API_KEY", "key")
+        patch(monkeypatch, {"to": [{"quotecurrency": "INR", "mid": 54.5}]})
+
+        raw = await XEProvider().fetch_raw_quote(Decimal("1000"), "AUD", "INR")
+        assert raw.ok is True
+        assert raw.error is None
+
+    @pytest.mark.asyncio
+    async def test_a_failed_reference_fetch_still_reports_not_ok(self, monkeypatch):
+        monkeypatch.setenv("XE_ACCOUNT_ID", "acct")
+        monkeypatch.setenv("XE_API_KEY", "key")
+        patch(monkeypatch, {}, status=503)
+
+        raw = await XEProvider().fetch_raw_quote(Decimal("1000"), "AUD", "INR")
+        assert raw.ok is False
