@@ -7,6 +7,7 @@ session could not reach any provider host. These tests pin our parsing and the
 maths built on it; `scripts/verify_providers.py` is what checks the shapes.
 """
 
+import json
 from decimal import Decimal
 
 import httpx
@@ -107,9 +108,18 @@ class TestPartnerAPIs:
 
         await InstaRemProvider().fetch_raw_quote(Decimal("1000.50"), "AUD", "INR")
         body = captured[0].read().decode()
-        # Quoted, so the exact decimal survives the wire. Unquoted it would be
-        # a JSON number and re-decoded as a float on the far side.
-        assert '"source_amount":"1000.50"' in body.replace(", ", ",")
+
+        # Assert on the decoded payload, not on the serialized text: whether
+        # httpx writes `"k": v` or `"k":v` is its business, and matching the
+        # raw string made this test fail for a provider that was behaving.
+        sent = json.loads(body)
+
+        # A str on the wire, so the exact decimal survives it. As a JSON
+        # number it would be re-decoded as a float on the far side, which is
+        # the precision loss the engine was fixed for — on the way OUT.
+        assert isinstance(sent["source_amount"], str)
+        assert sent["source_amount"] == "1000.50"
+        assert Decimal(sent["source_amount"]) == Decimal("1000.50")
 
     @pytest.mark.asyncio
     async def test_rejected_credentials_say_so(self, monkeypatch):

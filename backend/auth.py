@@ -5,6 +5,8 @@ from fastapi import HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jwt import PyJWKClient
 
+import clerk
+
 CLERK_JWKS_URL = os.environ.get("CLERK_JWKS_URL")
 
 jwks_client = PyJWKClient(CLERK_JWKS_URL) if CLERK_JWKS_URL else None
@@ -39,7 +41,13 @@ def verify_clerk_token(credentials: HTTPAuthorizationCredentials = Security(secu
 
         return {
             "clerk_user_id": clerk_user_id,
-            "email": payload.get("email"),  # Optional depending on Clerk config
+            # Clerk's DEFAULT session token carries no email claim at all — it
+            # is only present if a custom JWT template adds one, and templates
+            # spell it several ways. When it is absent the address is fetched
+            # from Clerk's Backend API on demand (see clerk.py); relying on
+            # this claim alone is what left every user row with email=NULL and
+            # stopped rate alerts from ever mailing anyone.
+            "email": clerk.email_from_claims(payload),
         }
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
