@@ -276,6 +276,14 @@ export default function Results() {
                     {data?.savings_vs_worst > 0 && bestPaying?.provider === best.provider && (
                       <div className="savings-pill">
                         💰 {money(data.savings_vs_worst, best.currency_to)} {best.currency_to} more than the worst option here
+                        {/* vs the average is the more honest everyday number:
+                            most people would not otherwise have picked the
+                            single worst provider. */}
+                        {data.savings_vs_average > 0 && (
+                          <span className="savings-avg">
+                            {" · "}{money(data.savings_vs_average, best.currency_to)} above average
+                          </span>
+                        )}
                       </div>
                     )}
                     {data?.savings_vs_worst > 0 && bestPaying && bestPaying.provider !== best.provider && (
@@ -475,6 +483,7 @@ export default function Results() {
         .empty-state { text-align: center; padding: 3rem 1.5rem; }
         .empty-state h3 { font-family: var(--font-display); font-weight: 700; font-size: 1.1rem; }
 
+        .savings-avg { opacity: 0.8; font-weight: 500; }
         .savings-note {
           margin-top: 0.6rem; font-size: 0.78rem;
           color: rgba(255, 255, 255, 0.7); line-height: 1.5;

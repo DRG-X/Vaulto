@@ -43,6 +43,9 @@ class RateAlert(Base):
     amount          = Column(Float, nullable=False)
     target_rate     = Column(Float, nullable=False)
     provider        = Column(String, nullable=True)   # None = any provider
+    # None = any rail. Lets an alert mean "when Wise's UPI rate hits X" rather
+    # than "when some rail of some provider does".
+    pay_out_method  = Column(String, nullable=True)
     notify_email    = Column(Boolean, default=True)
     notify_whatsapp = Column(Boolean, default=False)
     is_active       = Column(Boolean, default=True)

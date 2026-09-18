@@ -86,6 +86,24 @@ const CATEGORY_COLORS = {
   p2p: "var(--tertiary)",
 };
 
+/** Stable DOM-id fragment for a provider name. */
+export function providerSlug(name) {
+  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+/**
+ * Every provider slug, for `getStaticPaths`.
+ *
+ * Derived from the link table so the two cannot drift: a provider added to
+ * the backend registry needs a link here anyway, and adding one automatically
+ * gives it a detail page.
+ *
+ * Deliberately a build-time constant rather than a fetch — `getStaticPaths`
+ * runs during `next build`, when the API may not be reachable, and a failed
+ * fetch there would silently ship a site with no provider pages at all.
+ */
+export const ALL_PROVIDER_SLUGS = Object.keys(PROVIDER_LINKS).map(providerSlug);
+
 export function providerUrl(name) {
   const base = PROVIDER_LINKS[name];
   if (!base) return null;
@@ -98,11 +116,6 @@ export function providerIcon(quote) {
 
 export function providerColor(quote) {
   return CATEGORY_COLORS[quote?.category] || "var(--muted)";
-}
-
-/** Stable DOM-id fragment for a provider name. */
-export function providerSlug(name) {
-  return String(name).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
 /**

@@ -216,3 +216,96 @@ class TestBenchmarkIsolationEndToEnd:
 
         assert set(restored.benchmark) == set(pools.benchmark)
         assert "HOP Remit" not in restored.pools
+
+
+class TestProvidersEndpoint:
+    """
+    The registry, exposed as data.
+
+    The frontend directory listed three providers while the engine ranked 28 —
+    a hardcoded list goes stale the moment the registry grows. This endpoint is
+    the single source of truth for both.
+    """
+
+    @staticmethod
+    def _client():
+        import os
+        os.environ.setdefault("DATABASE_URL", "sqlite:///./test_providers.db")
+        from fastapi.testclient import TestClient
+        import main
+        return TestClient(main.app)
+
+    def test_lists_every_non_benchmark_provider(self):
+        body = self._client().get("/api/providers").json()
+        names = {p["name"] for p in body["providers"]}
+
+        assert body["total"] == len(ALL_PROVIDERS) - body["hidden_benchmark"]
+        assert {"Wise", "Remitly", "XE", "CommBank", "SBI", "TorFX", "Moneycorp"} <= names
+
+    def test_benchmark_only_providers_are_excluded_but_counted(self):
+        body = self._client().get("/api/providers").json()
+        assert "HOP Remit" not in {p["name"] for p in body["providers"]}
+        assert body["hidden_benchmark"] >= 1
+
+    def test_corridor_filter(self):
+        au = self._client().get("/api/providers?corridor=AUD:INR").json()
+        inr = self._client().get("/api/providers?corridor=INR:AUD").json()
+
+        au_names = {p["name"] for p in au["providers"]}
+        inr_names = {p["name"] for p in inr["providers"]}
+
+        assert "CommBank" in au_names and "CommBank" not in inr_names
+        assert "SBI" in inr_names and "SBI" not in au_names
+        assert "Wise" in au_names and "Wise" in inr_names   # both directions
+
+    def test_a_bad_corridor_is_rejected(self):
+        assert self._client().get("/api/providers?corridor=AUD").status_code == 422
+
+    def test_slugs_are_url_safe_and_unique(self):
+        providers = self._client().get("/api/providers").json()["providers"]
+        slugs = [p["slug"] for p in providers]
+
+        assert len(slugs) == len(set(slugs))
+        assert all(s and s.replace("-", "").isalnum() for s in slugs)
+        by_name = {p["name"]: p["slug"] for p in providers}
+        assert by_name["Western Union"] == "western-union"
+        assert by_name["HDFC Bank"] == "hdfc-bank"
+
+    def test_credential_NAMES_are_exposed_never_their_values(self, monkeypatch):
+        monkeypatch.setenv("OFX_API_KEY", "super-secret-value")
+        providers = self._client().get("/api/providers").json()["providers"]
+        ofx = next(p for p in providers if p["name"] == "OFX")
+
+        assert ofx["requires_credentials"] == ["OFX_API_KEY"]
+        assert ofx["is_configured"] is True
+        assert "super-secret-value" not in str(providers)
+
+    def test_limits_and_flags_round_trip(self):
+        providers = {p["name"]: p for p in self._client().get("/api/providers").json()["providers"]}
+
+        assert providers["TorFX"]["min_amount"] == 2000.0
+        assert providers["TorFX"]["limits_currency"] == "AUD"
+        assert providers["CommBank"]["avoid"] is True
+        assert providers["XE"]["rate_reference_only"] is True
+        assert providers["MoneyGram"]["needs_browser"] is True
+        assert "INR" in providers["Remitly"]["cannot_send_from"]
+
+    def test_ordered_by_priority_then_name(self):
+        providers = self._client().get("/api/providers").json()["providers"]
+        keys = [(p["priority"], p["name"]) for p in providers]
+        assert keys == sorted(keys)
+
+    def test_a_half_corridor_is_rejected(self):
+        """
+        "AUD:" passes a bare `":" in corridor` check and would otherwise skip
+        filtering entirely, returning all 27 providers as if each served it.
+        """
+        client = self._client()
+        for bad in ("AUD:", ":INR", ":", "  :  "):
+            assert client.get(f"/api/providers?corridor={bad}").status_code == 422, bad
+
+    def test_benchmark_count_is_scoped_to_the_corridor(self):
+        client = self._client()
+        # HOP Remit is INR->AUD only, so it is not "hidden" from AUD->INR.
+        assert client.get("/api/providers?corridor=AUD:INR").json()["hidden_benchmark"] == 0
+        assert client.get("/api/providers?corridor=INR:AUD").json()["hidden_benchmark"] >= 1

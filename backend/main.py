@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import sys
 import os
 from contextlib import asynccontextmanager
@@ -25,6 +26,7 @@ from schemas import (
     UserSync, UserRead, UserUpdate,
     OnboardingComplete,
     ComparisonCreate, ComparisonRead, SortMode,
+    ProviderInfo, ProviderListResponse,
     RateAlertCreate, RateAlertRead, RateAlertUpdate,
     ContactMessage,
     ClickCreate,
@@ -32,6 +34,7 @@ from schemas import (
 from decimal import Decimal
 
 from engine.comparator import QuotePools, compare, fetch_pools, rank_pools
+from providers import ALL_PROVIDERS
 
 import models
 from database import Base, engine, get_db
@@ -49,6 +52,51 @@ logging.basicConfig(
 logger = logging.getLogger("flint")
 
 
+
+def run_migrations() -> None:
+    """
+    Bring an EXISTING database up to head.
+
+    `create_all` only creates tables that are missing — it will never ALTER one
+    that already exists. So a column added in a migration (rate_alerts.
+    pay_out_method) appears on a fresh database and is silently absent on every
+    deployed one, where the next query then fails with "no such column".
+
+    Failure is logged loudly and re-raised: serving an API whose schema does
+    not match its models means every affected request 500s at runtime, which is
+    far harder to diagnose than a refusal to start.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    # `backend/alembic/` (the migrations directory) shadows the installed
+    # `alembic` package whenever the app is started from backend/, which is
+    # exactly how it is run — `uvicorn main:app`. Dropping this directory from
+    # sys.path for the duration of the import makes the real package win.
+    shadowing = [p for p in sys.path if p in ("", ".", here)]
+    for entry in shadowing:
+        sys.path.remove(entry)
+    try:
+        from alembic import command
+        from alembic.config import Config
+    finally:
+        sys.path[0:0] = shadowing
+    cfg = Config(os.path.join(here, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(here, "alembic"))
+    # Alembic's own env.py reads DATABASE_URL, but be explicit so a mismatch
+    # between the app's engine and the migration target is impossible.
+    cfg.set_main_option("sqlalchemy.url", str(engine.url).replace("%", "%%"))
+
+    try:
+        command.upgrade(cfg, "head")
+        logger.info("Database schema is at head")
+    except Exception:
+        logger.exception(
+            "Database migration failed — the schema does not match the models. "
+            "Run `alembic upgrade head` in backend/ and check DATABASE_URL."
+        )
+        raise
+
+
 # ── Lifespan (startup / shutdown) ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -56,6 +104,7 @@ async def lifespan(app: FastAPI):
     await init_cache()   # connect Redis + PING test
     from models import User, Comparison, RateAlert, ProviderClick  # noqa — ensures models registered
     Base.metadata.create_all(bind=engine)           # safety net: create tables if not present
+    run_migrations()                                 # ALTERs that create_all cannot do
     logger.info("CORS allowed origins: %s", ALLOWED_ORIGINS)
     start_scheduler()    # background alert checker — every 15 min
     yield
@@ -443,6 +492,89 @@ app.include_router(rates_router)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# /api/providers  — the registry, as data
+# ═══════════════════════════════════════════════════════════════════════════════
+
+providers_router = APIRouter(prefix="/api/providers", tags=["providers"])
+
+
+def _slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+@providers_router.get("", response_model=ProviderListResponse)
+async def list_providers(
+    corridor: Optional[str] = Query(
+        None,
+        description='Filter to providers serving a corridor, e.g. "AUD:INR"',
+    ),
+):
+    """
+    Every provider the engine knows about.
+
+    Benchmark-only providers are excluded: they are fetched for internal rate
+    tracking and must never reach a user-facing surface. The count is reported
+    separately so the omission reads as deliberate.
+    """
+    send = receive = None
+    if corridor:
+        # Both halves must be present. "AUD:" passes a bare `":" in corridor`
+        # check, yields an empty receive currency, and then silently skips
+        # filtering — returning every provider as though all of them served
+        # the corridor that was asked about.
+        parts = [part.strip().upper() for part in corridor.split(":", 1)]
+        if len(parts) != 2 or not all(parts):
+            raise HTTPException(
+                status_code=422, detail='corridor must look like "AUD:INR"'
+            )
+        send, receive = parts
+
+    out: list[ProviderInfo] = []
+    hidden = 0
+
+    for provider in ALL_PROVIDERS:
+        meta = provider.meta
+        in_corridor = not (send and receive) or meta.supports(send, receive)
+
+        if meta.benchmark_only:
+            # Counted only when it would otherwise have appeared, so the
+            # "N tracked for benchmarking" note describes this corridor rather
+            # than the whole registry.
+            if in_corridor:
+                hidden += 1
+            continue
+        if not in_corridor:
+            continue
+
+        out.append(ProviderInfo(
+            name=provider.name,
+            slug=_slug(provider.name),
+            category=meta.category.value,
+            integration=meta.integration.value,
+            priority=meta.priority,
+            corridors=[f"{a}->{b}" for a, b in meta.corridors],
+            cannot_send_from=list(meta.cannot_send_from),
+            min_amount=float(meta.min_amount) if meta.min_amount is not None else None,
+            max_amount=float(meta.max_amount) if meta.max_amount is not None else None,
+            limits_currency=meta.limits_currency,
+            # The NAMES of the required env vars, never their values.
+            requires_credentials=list(meta.credentials),
+            is_configured=meta.is_configured,
+            avoid=meta.avoid,
+            rate_reference_only=meta.rate_reference_only,
+            needs_browser=meta.needs_browser,
+            website=meta.website or None,
+            notes=meta.notes or None,
+        ))
+
+    out.sort(key=lambda p: (p.priority, p.name))
+    return ProviderListResponse(providers=out, total=len(out), hidden_benchmark=hidden)
+
+
+app.include_router(providers_router)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # /api/comparisons
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -514,6 +646,7 @@ def create_alert(
         amount          = body.amount,
         target_rate     = body.target_rate,
         provider        = body.provider,
+        pay_out_method  = body.pay_out_method,
         notify_email    = body.notify_email,
         notify_whatsapp = body.notify_whatsapp,
     )

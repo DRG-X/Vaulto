@@ -6,16 +6,36 @@ import Link from "next/link";
 import Nav from "../components/Nav";
 import Footer from "../components/Footer";
 import { listComparisons } from "../lib/api";
+import { money, rate, DASH } from "../lib/format";
 
 const fmt = (n, dec = 2) =>
   new Intl.NumberFormat("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec }).format(n);
 
+/**
+ * Summarise a saved comparison.
+ *
+ * Comparisons saved before the engine reported true cost have no `total_cost`,
+ * so it is returned as null and rendered as "—". Back-filling it here would
+ * mean recomputing a markup against a mid-market rate we never stored — a
+ * number that looks precise and is not.
+ */
 function parseResults(json) {
   try {
-    const r = JSON.parse(json || "[]");
-    const sorted = [...r].sort((a, b) => b.receive_amount - a.receive_amount);
-    return { bestProvider: sorted[0]?.provider || "—", bestRate: sorted[0]?.exchange_rate };
-  } catch { return { bestProvider: "—", bestRate: null }; }
+    const rows = JSON.parse(json || "[]").filter((r) => r && !r.error);
+    if (!rows.length) return { best: null, worst: null, spread: null };
+
+    const sorted = [...rows].sort((a, b) => b.receive_amount - a.receive_amount);
+    const best = sorted[0];
+    const worst = sorted[sorted.length - 1];
+
+    return {
+      best,
+      worst,
+      spread: sorted.length > 1 ? best.receive_amount - worst.receive_amount : null,
+    };
+  } catch {
+    return { best: null, worst: null, spread: null };
+  }
 }
 
 export default function History() {
@@ -58,16 +78,26 @@ export default function History() {
   });
 
   const exportCSV = () => {
-    const headers = ["Date", "From", "To", "Amount", "Best Rate", "Best Provider"];
+    const headers = [
+      "Date", "From", "To", "Amount",
+      "Best Rate", "True Cost", "Best Provider", "Recipient Gets",
+    ];
     const rows = filtered.map(c => {
-      const { bestProvider, bestRate } = parseResults(c.results_json);
+      const { best } = parseResults(c.results_json);
       return [
         new Date(c.created_at).toLocaleDateString(),
         c.from_currency, c.to_currency,
-        c.amount, bestRate || "—", bestProvider,
+        c.amount,
+        best?.exchange_rate ?? "",
+        best?.total_cost ?? "",
+        best?.provider ?? "",
+        best?.receive_amount ?? "",
       ];
     });
-    const csv = [headers, ...rows].map(r => r.join(",")).join("\n");
+    // Quote every cell: provider names contain spaces and, once rails are
+    // included, commas — an unquoted CSV would silently shift columns.
+    const escape = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const csv = [headers, ...rows].map(r => r.map(escape).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -135,13 +165,14 @@ export default function History() {
                       <th>Corridor</th>
                       <th>Amount</th>
                       <th>Best Rate</th>
+                      <th>True Cost</th>
                       <th>Best Provider</th>
                       <th></th>
                     </tr>
                   </thead>
                   <tbody>
                     {filtered.map((c, i) => {
-                      const { bestProvider, bestRate } = parseResults(c.results_json);
+                      const { best, spread } = parseResults(c.results_json);
                       return (
                         <tr key={i}>
                           <td style={{ color: "var(--muted)", fontSize: "0.85rem" }}>
@@ -152,11 +183,25 @@ export default function History() {
                               {c.from_currency} → {c.to_currency}
                             </span>
                           </td>
-                          <td>{fmt(c.amount)} {c.from_currency}</td>
+                          <td>{money(c.amount, c.from_currency)} {c.from_currency}</td>
                           <td style={{ color: "var(--tertiary)", fontWeight: 700 }}>
-                            {bestRate ? fmt(bestRate, 4) : "—"}
+                            {best ? rate(best.exchange_rate) : DASH}
                           </td>
-                          <td style={{ fontWeight: 600 }}>{bestProvider}</td>
+                          <td>
+                            {/* True cost, where the saved snapshot has it.
+                                Older saves predate the field. */}
+                            {best?.total_cost != null
+                              ? `${money(best.total_cost, c.from_currency)} ${c.from_currency}`
+                              : DASH}
+                          </td>
+                          <td style={{ fontWeight: 600 }}>
+                            {best?.provider || DASH}
+                            {spread > 0 && (
+                              <div style={{ fontSize: "0.72rem", color: "var(--muted)", fontWeight: 400 }}>
+                                {money(spread, c.to_currency)} {c.to_currency} ahead of worst
+                              </div>
+                            )}
+                          </td>
                           <td>
                             <Link
                               href={`/results?from=${c.from_currency}&to=${c.to_currency}&amount=${c.amount}`}

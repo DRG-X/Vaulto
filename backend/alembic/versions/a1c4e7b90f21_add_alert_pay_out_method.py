@@ -1,0 +1,25 @@
+"""Add pay_out_method to rate_alerts
+
+An alert can now be scoped to a delivery rail, so "tell me when Wise's UPI
+rate hits 55" is expressible. Nullable, so every existing alert keeps its
+current meaning: any rail.
+
+Revision ID: a1c4e7b90f21
+Revises: 0b82c2271300
+Create Date: 2026-09-18
+"""
+from alembic import op
+import sqlalchemy as sa
+
+revision = "a1c4e7b90f21"
+down_revision = "0b82c2271300"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    op.add_column("rate_alerts", sa.Column("pay_out_method", sa.String(), nullable=True))
+
+
+def downgrade():
+    op.drop_column("rate_alerts", "pay_out_method")

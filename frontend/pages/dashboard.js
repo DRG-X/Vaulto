@@ -6,6 +6,7 @@ import Link from "next/link";
 import CompareWidget from "../components/CompareWidget";
 import AlertModal from "../components/AlertModal";
 import { getMe, listComparisons, listAlerts, syncUser } from "../lib/api";
+import { money, DASH } from "../lib/format";
 import { isAdmin } from "../lib/admin";
 
 // ── SVG Icons — outlined stroke style matching target design ────────────────
@@ -316,13 +317,24 @@ export default function Dashboard() {
                 ) : comparisons.length > 0 ? (
                   <div className="recent-list">
                     {comparisons.slice(0, 5).map((c, i) => {
-                      let best = "—";
-                      try { const r = JSON.parse(c.results_json || "[]"); best = r[0]?.provider || "—"; } catch {}
+                      // Picked by receive amount rather than list position:
+                      // a snapshot saved under "fastest" or "lowest fee" is
+                      // not ordered by who paid the most.
+                      let best = null;
+                      try {
+                        const rows = JSON.parse(c.results_json || "[]").filter((r) => r && !r.error);
+                        best = rows.sort((a, b) => b.receive_amount - a.receive_amount)[0] || null;
+                      } catch {}
                       return (
                         <div key={i} className="recent-item">
                           <div>
                             <div className="recent-corridor">{c.from_currency} → {c.to_currency}</div>
-                            <div className="recent-meta">{new Date(c.created_at).toLocaleDateString()} · {best}</div>
+                            <div className="recent-meta">
+                              {new Date(c.created_at).toLocaleDateString()} · {best?.provider || DASH}
+                              {best?.total_cost != null && (
+                                <> · cost {money(best.total_cost, c.from_currency)} {c.from_currency}</>
+                              )}
+                            </div>
                           </div>
                           <Link href={`/results?from=${c.from_currency}&to=${c.to_currency}&amount=${c.amount}`} className="recent-rerun">
                             Re-run →

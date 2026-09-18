@@ -177,6 +177,42 @@ class CompareResponse(BaseModel):
     unavailable_providers: Dict[str, str] = {}
 
 
+class ProviderInfo(BaseModel):
+    """
+    One provider as the registry knows it — no rates, no network.
+
+    Lets the client render the full directory from the same source the engine
+    ranks from. The alternative, a hardcoded list in the frontend, went stale
+    the moment the registry grew past three providers.
+    """
+
+    name: str
+    slug: str
+    category: str
+    integration: str            # public_api | partner_api | partial_api | scrape
+    priority: int               # 1 = Critical .. 4 = Low
+    corridors: List[str]        # e.g. ["AUD->INR"] or ["*->*"]
+    cannot_send_from: List[str] = []
+    min_amount: Optional[float] = None
+    max_amount: Optional[float] = None
+    limits_currency: Optional[str] = None
+    requires_credentials: List[str] = []
+    is_configured: bool = True
+    avoid: bool = False
+    rate_reference_only: bool = False
+    needs_browser: bool = False
+    website: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ProviderListResponse(BaseModel):
+    providers: List[ProviderInfo]
+    total: int
+    #: Providers tracked for benchmarking are excluded by design, and the count
+    #: is reported so the omission is visible rather than looking like a bug.
+    hidden_benchmark: int = 0
+
+
 # ── User schemas ──────────────────────────────────────────────────────────────
 
 class UserSync(BaseModel):
@@ -283,9 +319,17 @@ class RateAlertCreate(BaseModel):
     to_currency: str
     amount: float
     target_rate: float
+    #: None = any provider. When set, the alert watches THAT provider's rate.
     provider: Optional[str] = None
+    #: None = any rail. Canonical name, e.g. "BANK_DEPOSIT" or "UPI".
+    pay_out_method: Optional[str] = None
     notify_email: bool = True
     notify_whatsapp: bool = False
+
+    @field_validator("pay_out_method")
+    @classmethod
+    def normalize_rail(cls, v):
+        return v.strip().upper() if isinstance(v, str) and v.strip() else None
 
 
 class RateAlertRead(BaseModel):
@@ -296,6 +340,7 @@ class RateAlertRead(BaseModel):
     amount: float
     target_rate: float
     provider: Optional[str] = None
+    pay_out_method: Optional[str] = None
     notify_email: bool
     notify_whatsapp: bool
     is_active: bool
@@ -312,6 +357,7 @@ class RateAlertUpdate(BaseModel):
     notify_email: Optional[bool] = None
     notify_whatsapp: Optional[bool] = None
     provider: Optional[str] = None
+    pay_out_method: Optional[str] = None
 
 
 class ContactMessage(BaseModel):

@@ -23,6 +23,7 @@ export default function ProviderStatus({ data }) {
   const unavailable = data?.unavailable_providers || {};
   const filtered = data?.filtered_out || [];
   const failed = data?.failed_providers || [];
+  const errors = (data?.errors || []).filter((q) => q?.error);
 
   const unavailableCount = Object.keys(unavailable).length;
   const total = unavailableCount + filtered.length + failed.length;
@@ -34,8 +35,22 @@ export default function ProviderStatus({ data }) {
           only one shown without being asked for. */}
       {failed.length > 0 && (
         <div className="ps-failed">
-          <strong>Couldn't reach {failed.length} provider{failed.length === 1 ? "" : "s"}:</strong>{" "}
-          {failed.join(", ")}
+          <strong>Couldn't reach {failed.length} provider{failed.length === 1 ? "" : "s"}</strong>
+          {/* The backend sends the reason per provider. A bare list of names
+              says nothing actionable — "Wise: 503" and "SBI: page layout has
+              probably changed" need very different responses. */}
+          {errors.length > 0 ? (
+            <ul className="ps-failed-list">
+              {errors.map((q) => (
+                <li key={q.provider}>
+                  <span className="ps-failed-name">{q.provider}</span>
+                  <span className="ps-failed-why">{q.error}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <span> — {failed.join(", ")}</span>
+          )}
         </div>
       )}
 
@@ -80,6 +95,13 @@ export default function ProviderStatus({ data }) {
           padding: 0.7rem 0.9rem; border-radius: var(--radius-md);
         }
         .ps-failed { background: var(--error-surface); color: var(--error); }
+        .ps-failed-list {
+          list-style: none; margin-top: 0.5rem;
+          display: flex; flex-direction: column; gap: 0.3rem;
+        }
+        .ps-failed-list li { display: flex; gap: 0.5rem; flex-wrap: wrap; font-size: 0.78rem; }
+        .ps-failed-name { font-weight: 600; min-width: 7rem; }
+        .ps-failed-why { flex: 1; opacity: 0.85; }
         .ps-filtered { background: var(--surface-high); color: var(--text-mid); }
         .ps-toggle {
           align-self: flex-start;
@@ -127,7 +149,8 @@ export function MidMarketNote({ data }) {
 
   return (
     <p className="mm">
-      Mid-market rate <strong>{fmtRate(midRate)}</strong>
+      Mid-market rate{" "}
+      <strong title={data.mid_market_rate_exact || undefined}>{fmtRate(midRate)}</strong>
       {source && <span className="mm-src"> via {source}</span>} — every markup below is
       measured against it.
       <style jsx>{`

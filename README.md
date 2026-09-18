@@ -104,7 +104,7 @@ flint/
 │   │   ├── ranking.py          # Sort modes + filters
 │   │   ├── sanity.py           # Reject rates that cannot be right
 │   │   └── comparator.py       # Select, fetch, normalize, filter, rank
-│   └── tests/                  # 287 tests
+│   └── tests/                  # 309 tests
 │
 └── frontend/
     ├── next.config.js
@@ -306,6 +306,22 @@ unchanged. The rest is additive.
   the provider's own published receive amount.
 * **`fx_markup_pct` is `null`** when no mid-market reference was available.
 
+### `GET /api/providers`
+
+The registry as data — every provider the engine knows about, with its
+category, corridors, transfer limits and integration type. The frontend
+directory and the alert provider picker both read from it, so neither can
+drift from what the engine actually compares.
+
+```bash
+curl "http://localhost:8000/api/providers?corridor=AUD:INR"
+```
+
+Benchmark-only providers are excluded and counted separately in
+`hidden_benchmark`, so the omission reads as deliberate. Credential **names**
+are exposed (`requires_credentials`) so a client can say what is missing;
+their values never are.
+
 ### `GET /api/rates`
 
 The same comparison as a GET, for the results page. Takes `from`, `to`,
@@ -387,7 +403,7 @@ outage should never end the comparison.
 cd backend && python -m pytest tests/ -q
 ```
 
-287 tests covering Decimal precision and rounding, ISO-4217 minor units,
+309 tests covering Decimal precision and rounding, ISO-4217 minor units,
 delivery parsing, fee-model re-basing, the five sort modes, the filters, and a
 full three-provider comparison.
 
@@ -521,6 +537,12 @@ panel of invented figures ("Rate: ~52–54 INR per AUD (estimated)"). Those are
 gone. Banks are live quotes on the same fee-inclusive basis as everything
 else, carrying the backend's own `avoid` flag, collapsed behind a toggle that
 names the actual gap.
+
+**Rate alerts watch what they name.** An alert scoped to a provider (or a
+delivery rail) now watches *that* quote, not whichever provider happens to be
+cheapest. It reads the full option pool rather than the ranked comparison,
+because ranking collapses each provider to one rail — a "Remitly via UPI"
+alert looking at the ranked output would only ever see Remitly's bank row.
 
 **"Not shown" is three different things.** Providers that don't serve the
 corridor, need an API key, or fall outside their transfer limits appear under

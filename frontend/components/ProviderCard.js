@@ -200,6 +200,18 @@ export default function ProviderCard({ quote, rank, badges = [], onAlert, ratesD
           {payIn && <div><dt>Funded by</dt><dd>{payIn}</dd></div>}
           {quote.service_name && <div><dt>Service</dt><dd>{quote.service_name}</dd></div>}
           <div>
+            <dt>Figure source</dt>
+            <dd>
+              {/* Whether the figure is the provider's own or one we derived by
+                  re-basing their quote onto the fee-inclusive basis. Worth
+                  saying: it is the difference between a quoted price and a
+                  computed one. */}
+              {quote.normalized
+                ? "Re-based by Vaulto to a fee-inclusive basis"
+                : "As published by the provider"}
+            </dd>
+          </div>
+          <div>
             <dt>Fee model</dt>
             <dd>
               {quote.fee_model === "deducted"

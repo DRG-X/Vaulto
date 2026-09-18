@@ -5,6 +5,7 @@ import Head from "next/head";
 import Link from "next/link";
 import Nav from "../components/Nav";
 import Footer from "../components/Footer";
+import { railLabel } from "../lib/format";
 import AlertModal from "../components/AlertModal";
 import { listAlerts, updateAlert, deleteAlert, getMe } from "../lib/api";
 
@@ -206,6 +207,10 @@ function AlertCard({ alert, onToggle, onEdit, onDelete, deleting }) {
         <div className="ac-row"><span className="ac-label">Target rate</span><span className="ac-val">{alert.target_rate}</span></div>
         <div className="ac-row"><span className="ac-label">Amount</span><span className="ac-val">{alert.amount} {alert.from_currency}</span></div>
         <div className="ac-row"><span className="ac-label">Provider</span><span className="ac-val">{alert.provider || "Any"}</span></div>
+        <div className="ac-row">
+          <span className="ac-label">Delivery</span>
+          <span className="ac-val">{railLabel(alert.pay_out_method) || "Any"}</span>
+        </div>
         <div className="ac-row"><span className="ac-label">Notify via</span>
           <span className="ac-val">
             {[alert.notify_email && "Email", alert.notify_whatsapp && "WhatsApp"].filter(Boolean).join(" + ") || "Email"}

@@ -3,6 +3,7 @@ import Head from "next/head";
 import Link from "next/link";
 import Nav from "../components/Nav";
 import Footer from "../components/Footer";
+import ProviderDirectory from "../components/ProviderDirectory";
 
 const PROVIDERS = [
   {
@@ -89,7 +90,7 @@ export default function Providers() {
     <>
       <Head>
         <title>Browse Money Transfer Providers — Vaulto</title>
-        <meta name="description" content="Compare Wise, Remitly, and Western Union. See fees, speeds, and features side by side." />
+        <meta name="description" content="Every money transfer provider Vaulto compares — fintechs, brokers, neobanks and banks. Fees, speeds, corridors and transfer limits side by side." />
       </Head>
       <Nav variant="light" />
 
@@ -155,6 +156,22 @@ export default function Providers() {
       </section>
 
       {/* CTA dark band */}
+      {/* Full registry — the three cards above are the ones we have written
+          up in depth; this is everything the engine actually compares. */}
+      <section className="providers-all">
+        <div className="container">
+          <p className="label-sm" style={{ marginBottom: "0.5rem" }}>Every provider we compare</p>
+          <h2 className="display-sm" style={{ marginBottom: "0.5rem" }}>
+            The full list
+          </h2>
+          <p style={{ color: "var(--muted)", marginBottom: "2rem", maxWidth: 620 }}>
+            Live on every search. Banks are included on purpose — seeing the gap is
+            the point.
+          </p>
+          <ProviderDirectory />
+        </div>
+      </section>
+
       <section className="providers-cta">
         <div className="container" style={{ textAlign: "center" }}>
           <h2 className="display-md" style={{ color: "white", marginBottom: "1rem" }}>A Truly Borderless Network</h2>
@@ -205,6 +222,8 @@ export default function Providers() {
         .prov-best-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; margin-bottom: 0.35rem; }
         .prov-best-item { font-size: 0.85rem; color: var(--text-mid); margin-bottom: 0.2rem; }
         .prov-actions { display: flex; gap: 0.75rem; padding: 1rem 1.5rem 1.5rem; }
+
+        .providers-all { padding: 4rem 0; background: var(--surface-low); }
 
         .providers-cta {
           background: linear-gradient(135deg, var(--primary), #1e3460);

@@ -1,9 +1,20 @@
 import { useState, useEffect, useRef } from "react";
 import { useAuth } from "@clerk/nextjs";
 import { CURRENCIES } from "../lib/currencies";
-import { createAlert, updateAlert } from "../lib/api";
+import { createAlert, updateAlert, listProviders } from "../lib/api";
+import { railLabel } from "../lib/format";
 
-const PROVIDERS = ["Any provider", "Wise", "Remitly", "Western Union", "XE", "Revolut", "PaySend"];
+/**
+ * Delivery rails an alert can be scoped to. Canonical names, matching the ones
+ * the backend normalizes every provider's vocabulary to (providers/rails.py).
+ */
+const PAYOUT_RAILS = [
+  { value: "", label: "Any delivery method" },
+  { value: "BANK_DEPOSIT", label: "Bank deposit" },
+  { value: "UPI", label: "UPI" },
+  { value: "CASH_PICKUP", label: "Cash pickup" },
+  { value: "MOBILE_WALLET", label: "Mobile wallet" },
+];
 
 /**
  * AlertModal — create or edit a rate alert.
@@ -36,6 +47,10 @@ export default function AlertModal({
   const [amount, setAmount]           = useState(String(editAlert?.amount || defaultAmount));
   const [targetRate, setTargetRate]   = useState(String(editAlert?.target_rate || ""));
   const [provider, setProvider]       = useState(editAlert?.provider || "");
+  const [payOut, setPayOut]           = useState(editAlert?.pay_out_method || "");
+  // Loaded from the registry rather than hardcoded — a client-side list goes
+  // stale silently and omits providers the engine is already comparing.
+  const [providers, setProviders]     = useState([]);
   const [notifyEmail, setNotifyEmail] = useState(editAlert?.notify_email ?? true);
   const [notifyWA, setNotifyWA]       = useState(editAlert?.notify_whatsapp ?? false);
   const [loading, setLoading]         = useState(false);
@@ -49,11 +64,39 @@ export default function AlertModal({
       setAmount(String(editAlert?.amount || defaultAmount));
       setTargetRate(String(editAlert?.target_rate || ""));
       setProvider(editAlert?.provider || "");
+      setPayOut(editAlert?.pay_out_method || "");
       setNotifyEmail(editAlert?.notify_email ?? true);
       setNotifyWA(editAlert?.notify_whatsapp ?? false);
       setError("");
     }
   }, [isOpen, editAlert]);
+
+  // Only the providers that actually serve this corridor: offering an alert on
+  // one that does not would create a watch that can never fire.
+  useEffect(() => {
+    if (!isOpen || !from || !to || from === to) return;
+    let cancelled = false;
+
+    listProviders({ corridor: `${from}:${to}` })
+      .then((data) => {
+        if (cancelled) return;
+        // Corridor alone is not enough. A provider that needs an unset API
+        // key, only publishes a reference rate, or sits behind a JavaScript
+        // calculator will never produce a quote — offering it would create
+        // exactly the watch that can never fire.
+        setProviders(
+          (data?.providers || []).filter(
+            (p) => p.is_configured && !p.rate_reference_only && !p.needs_browser
+          )
+        );
+      })
+      .catch(() => {
+        // Non-critical: the alert still works scoped to "any provider".
+        if (!cancelled) setProviders([]);
+      });
+
+    return () => { cancelled = true; };
+  }, [isOpen, from, to]);
 
   // Close on backdrop click
   useEffect(() => {
@@ -89,7 +132,8 @@ export default function AlertModal({
       to_currency:     to,
       amount:          parsedAmount,
       target_rate:     parsedRate,
-      provider:        provider && provider !== "Any provider" ? provider : null,
+      provider:        provider || null,
+      pay_out_method:  payOut || null,
       notify_email:    notifyEmail,
       notify_whatsapp: notifyWA && !!userWhatsapp,
     };
@@ -123,7 +167,15 @@ export default function AlertModal({
         <form onSubmit={handleSubmit}>
           <div className="modal-body">
             <p className="modal-hint">
-              We'll notify you when 1 {from} buys more than {targetRate || "___"} {to}{provider && provider !== "Any provider" ? ` via ${provider}` : ""}.
+              We'll notify you when 1 {from} buys more than {targetRate || "___"} {to}
+              {provider ? ` via ${provider}` : ""}
+              {payOut ? ` to ${(railLabel(payOut) || "").toLowerCase()}` : ""}.
+              {provider && (
+                <>
+                  {" "}We watch <strong>{provider}</strong>'s rate specifically — not
+                  whichever provider happens to be cheapest.
+                </>
+              )}
             </p>
 
             {/* From / To */}
@@ -178,8 +230,21 @@ export default function AlertModal({
             <div className="field">
               <label htmlFor="alert-provider">Provider (optional)</label>
               <select id="alert-provider" value={provider} onChange={(e) => setProvider(e.target.value)}>
-                {PROVIDERS.map((p) => (
-                  <option key={p} value={p}>{p}</option>
+                <option value="">Any provider</option>
+                {providers.map((p) => (
+                  <option key={p.slug} value={p.name}>
+                    {p.name}{p.avoid ? " (expensive)" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Delivery rail */}
+            <div className="field">
+              <label htmlFor="alert-payout">Delivery method (optional)</label>
+              <select id="alert-payout" value={payOut} onChange={(e) => setPayOut(e.target.value)}>
+                {PAYOUT_RAILS.map((r) => (
+                  <option key={r.value} value={r.value}>{r.label}</option>
                 ))}
               </select>
             </div>

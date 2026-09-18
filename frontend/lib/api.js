@@ -164,6 +164,25 @@ export async function getRates({
   return handleResponse(res);
 }
 
+// ── /api/providers ─────────────────────────────────────────────────────────────
+
+/**
+ * Every provider the engine knows about, from the registry itself.
+ *
+ * The client keeps no provider list of its own: one went stale the moment the
+ * backend grew past three providers, and a stale list is worse than none —
+ * it silently omits options the engine is already comparing.
+ *
+ * `corridor` is "AUD:INR" style and narrows to providers serving it.
+ */
+export async function listProviders({ corridor } = {}) {
+  const params = new URLSearchParams();
+  if (corridor) params.set("corridor", corridor);
+  const qs = params.toString();
+  const res = await fetch(`${API_URL}/api/providers${qs ? `?${qs}` : ""}`);
+  return handleResponse(res);
+}
+
 // ── /api/comparisons ───────────────────────────────────────────────────────────
 
 export async function saveComparison(token, data) {
