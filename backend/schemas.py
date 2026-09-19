@@ -1,4 +1,6 @@
-from pydantic import BaseModel, field_validator
+import re
+
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Optional, List, Dict
 from datetime import datetime
 from enum import Enum
@@ -215,11 +217,71 @@ class ProviderListResponse(BaseModel):
 
 # ── User schemas ──────────────────────────────────────────────────────────────
 
+# Shared field normalisers. Onboarding and the settings page write the same
+# columns, so they normalise identically — otherwise "gbp" from one screen and
+# "GBP" from the other are two different corridors to every query that follows.
+
+def normalize_country(v: Optional[str], *, required: bool = False) -> Optional[str]:
+    v = (v or "").strip().upper()
+    if not v:
+        if required:
+            raise ValueError("country is required")
+        return None
+    if not (len(v) == 2 and v.isalpha()):
+        raise ValueError("country must be a 2-letter ISO code, e.g. 'GB'")
+    return v
+
+
+def normalize_currency(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    v = v.strip().upper()
+    if not v:
+        return None
+    if not (len(v) == 3 and v.isalpha()):
+        raise ValueError("currency must be a 3-letter ISO code, e.g. 'GBP'")
+    return v
+
+
+def normalize_phone(v: Optional[str]) -> Optional[str]:
+    """
+    Store one canonical shape (+ digits) so the alert sender never has to guess
+    whether "+44 7700 900 123" and "+447700900123" are the same number.
+    """
+    if v is None:
+        return None
+    compact = re.sub(r"[\s()\-.]", "", v.strip())
+    if not compact:
+        return None
+    if not compact.startswith("+"):
+        compact = "+" + compact
+    digits = compact[1:]
+    if not digits.isdigit() or not (7 <= len(digits) <= 15):
+        raise ValueError("whatsapp_number must be 7-15 digits, e.g. '+447700900123'")
+    return compact
+
+
 class UserSync(BaseModel):
-    """Called after Clerk sign-up to upsert the user row."""
-    clerk_id: str
-    email: str
+    """
+    Called after Clerk sign-up/sign-in to upsert the user row.
+
+    Every field is optional on purpose. The row is keyed off the `sub` claim of
+    the verified JWT, never off the body, so a client that calls sync one tick
+    before Clerk has hydrated its user object still syncs the right account
+    instead of being rejected. `clerk_id` is accepted when the caller knows it
+    and is then checked against the token — a mismatch is a real error.
+    """
+    clerk_id: Optional[str] = None
+    email: Optional[str] = None
     full_name: Optional[str] = None
+
+    @field_validator("clerk_id", "email", "full_name")
+    @classmethod
+    def _blank_to_none(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
 
 class UserRead(BaseModel):
@@ -241,6 +303,11 @@ class UserRead(BaseModel):
 
 
 class UserUpdate(BaseModel):
+    """
+    Partial update from the settings page. Values are normalised to the same
+    shapes onboarding stores, so a corridor saved in settings and one saved in
+    onboarding are byte-identical.
+    """
     full_name: Optional[str] = None
     whatsapp_number: Optional[str] = None
     country: Optional[str] = None
@@ -250,16 +317,79 @@ class UserUpdate(BaseModel):
     corridor_to: Optional[str] = None
     is_onboarded: Optional[bool] = None
 
+    @field_validator("home_currency", "corridor_from", "corridor_to")
+    @classmethod
+    def _currency(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_currency(v)
+
+    @field_validator("whatsapp_number")
+    @classmethod
+    def _whatsapp(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_phone(v)
+
+    @field_validator("country")
+    @classmethod
+    def _country(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_country(v)
+
+    @model_validator(mode="after")
+    def _corridor_legs_differ(self) -> "UserUpdate":
+        if self.corridor_from and self.corridor_to and self.corridor_from == self.corridor_to:
+            raise ValueError("corridor_from and corridor_to must be different currencies")
+        return self
+
 
 # ── Onboarding schema ─────────────────────────────────────────────────────────
 
 class OnboardingComplete(BaseModel):
+    """
+    Final step of the onboarding wizard.
+
+    `country` is where the user SENDS FROM (where they live or study), which is
+    also the country their university is in. `corridor_from` is that country's
+    currency and `corridor_to` / `home_currency` belong to the country they send
+    money home to.
+
+    The two corridor legs are validated against each other here rather than in
+    the route: a corridor whose legs are equal is not a comparison the engine
+    can answer, and storing one turns every "compare now" link on the dashboard
+    into an error page.
+    """
     country: str
     university: Optional[str] = None
     whatsapp_number: Optional[str] = None
     home_currency: Optional[str] = None
     corridor_from: Optional[str] = None
     corridor_to: Optional[str] = None
+
+    @field_validator("country")
+    @classmethod
+    def _iso_country(cls, v: str) -> str:
+        return normalize_country(v, required=True)
+
+    @field_validator("home_currency", "corridor_from", "corridor_to")
+    @classmethod
+    def _iso_currency(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_currency(v)
+
+    @field_validator("university")
+    @classmethod
+    def _trim_university(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip()
+        return v[:200] or None
+
+    @field_validator("whatsapp_number")
+    @classmethod
+    def _e164(cls, v: Optional[str]) -> Optional[str]:
+        return normalize_phone(v)
+
+    @model_validator(mode="after")
+    def _corridor_legs_differ(self) -> "OnboardingComplete":
+        if self.corridor_from and self.corridor_to and self.corridor_from == self.corridor_to:
+            raise ValueError("corridor_from and corridor_to must be different currencies")
+        return self
 
 
 # ── Legacy profile schemas (kept for backwards compatibility) ─────────────────

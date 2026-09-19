@@ -7,6 +7,7 @@ import Nav from "../components/Nav";
 import Footer from "../components/Footer";
 import { listComparisons } from "../lib/api";
 import { money, rate, DASH } from "../lib/format";
+import { signInPath } from "../lib/redirect";
 
 const fmt = (n, dec = 2) =>
   new Intl.NumberFormat("en-US", { minimumFractionDigits: dec, maximumFractionDigits: dec }).format(n);
@@ -51,7 +52,7 @@ export default function History() {
 
   useEffect(() => {
     if (!isLoaded) return;
-    if (!isSignedIn) { router.replace("/auth"); return; }
+    if (!isSignedIn) { router.replace(signInPath(router.asPath)); return; }
     loadComparisons(page);
   }, [isLoaded, isSignedIn, page]);
 
@@ -65,6 +66,7 @@ export default function History() {
       setComparisons(items);
       setHasMore(items.length === 20);
     } catch (e) {
+      if (e?.status === 401) { router.replace(signInPath(router.asPath)); return; }
       setError(e.message || "Failed to load history.");
     } finally {
       setLoading(false);
