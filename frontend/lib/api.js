@@ -6,10 +6,44 @@ function authHeaders(token) {
   return { "Authorization": `Bearer ${token}` };
 }
 
+/**
+ * Fetch that cannot hang forever.
+ *
+ * The sign-in and onboarding screens block on these calls — they are all the
+ * user can see. A backend that accepts the connection and then goes quiet
+ * (a cold container, a dropped mobile connection) leaves a spinner spinning
+ * with no way out, which reads as "the product is broken". A rejection gives
+ * the screen something to say and a Retry button to offer.
+ */
+async function fetchWithTimeout(url, options = {}, timeoutMs = 20000) {
+  if (typeof AbortController === "undefined") return fetch(url, options);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      const timeout = new Error("The server took too long to respond.");
+      timeout.status = 0;
+      timeout.isTimeout = true;
+      throw timeout;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function handleResponse(res) {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    const errorObj = new Error(err.detail || "API request failed");
+    const detail = err.detail;
+    // FastAPI returns 422 detail as a list of field errors — join them into
+    // something a person can act on instead of showing "[object Object]".
+    const message = Array.isArray(detail)
+      ? detail.map(d => d?.msg || String(d)).join(", ")
+      : (typeof detail === "string" ? detail : null);
+    const errorObj = new Error(message || "API request failed");
     errorObj.status = res.status;
     throw errorObj;
   }
@@ -20,21 +54,21 @@ async function handleResponse(res) {
 
 /** Quick check: does this user have a saved profile? */
 export async function checkUserStatus(token) {
-  const res = await fetch(`${API_URL}/user/status`, {
+  const res = await fetchWithTimeout(`${API_URL}/user/status`, {
     headers: authHeaders(token),
   });
   return handleResponse(res);
 }
 
 export async function getUserProfile(token) {
-  const res = await fetch(`${API_URL}/user/profile`, {
+  const res = await fetchWithTimeout(`${API_URL}/user/profile`, {
     headers: authHeaders(token),
   });
   return handleResponse(res);
 }
 
 export async function createUserProfile(token, data) {
-  const res = await fetch(`${API_URL}/user/profile`, {
+  const res = await fetchWithTimeout(`${API_URL}/user/profile`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders(token) },
     body: JSON.stringify(data),
@@ -101,7 +135,7 @@ export async function compareProviders({
 
 /** Upsert user row after Clerk sign-in/sign-up */
 export async function syncUser(token, { clerk_id, email, full_name }) {
-  const res = await fetch(`${API_URL}/api/users/sync`, {
+  const res = await fetchWithTimeout(`${API_URL}/api/users/sync`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders(token) },
     body: JSON.stringify({ clerk_id, email, full_name }),
@@ -111,7 +145,7 @@ export async function syncUser(token, { clerk_id, email, full_name }) {
 
 /** GET /api/users/me — returns full user row */
 export async function getMe(token) {
-  const res = await fetch(`${API_URL}/api/users/me`, {
+  const res = await fetchWithTimeout(`${API_URL}/api/users/me`, {
     headers: authHeaders(token),
   });
   return handleResponse(res);
@@ -119,7 +153,7 @@ export async function getMe(token) {
 
 /** PATCH /api/users/me — partial update */
 export async function updateMe(token, data) {
-  const res = await fetch(`${API_URL}/api/users/me`, {
+  const res = await fetchWithTimeout(`${API_URL}/api/users/me`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", ...authHeaders(token) },
     body: JSON.stringify(data),
@@ -130,7 +164,7 @@ export async function updateMe(token, data) {
 // ── /api/onboarding ────────────────────────────────────────────────────────────
 
 export async function completeOnboarding(token, data) {
-  const res = await fetch(`${API_URL}/api/onboarding/complete`, {
+  const res = await fetchWithTimeout(`${API_URL}/api/onboarding/complete`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders(token) },
     body: JSON.stringify(data),

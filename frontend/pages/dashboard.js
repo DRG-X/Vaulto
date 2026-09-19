@@ -8,6 +8,7 @@ import AlertModal from "../components/AlertModal";
 import { getMe, listComparisons, listAlerts, syncUser } from "../lib/api";
 import { money, DASH } from "../lib/format";
 import { isAdmin } from "../lib/admin";
+import { signInPath } from "../lib/redirect";
 
 // ── SVG Icons — outlined stroke style matching target design ────────────────
 const Icons = {
@@ -75,15 +76,18 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!isLoaded) return;
-    if (!isSignedIn) { router.replace("/auth"); return; }
+    if (!isSignedIn) { router.replace(signInPath(router.asPath)); return; }
+    // Wait for the Clerk user object. Syncing with a blank id used to be
+    // refused, which left the dashboard without the row it then 404s on.
+    if (!user?.id) return;
 
     const load = async () => {
       try {
         const syncToken = await getToken();
         await syncUser(syncToken, {
-          clerk_id:  user?.id || "",
-          email:     user?.primaryEmailAddress?.emailAddress || "",
-          full_name: user?.fullName || user?.username || "",
+          clerk_id:  user.id,
+          email:     user.primaryEmailAddress?.emailAddress || "",
+          full_name: user.fullName || user.username || "",
         });
       } catch (_) {}
 
@@ -103,7 +107,7 @@ export default function Dashboard() {
         if (!me) {
           const err = meResult.reason || {};
           if      (err.status === 404) router.replace("/onboarding");
-          else if (err.status === 401) router.replace("/auth");
+          else if (err.status === 401) router.replace(signInPath(router.asPath));
           else setError("Could not load your profile. Refresh to try again.");
           setLoading(false);
           return;
@@ -126,7 +130,7 @@ export default function Dashboard() {
       }
     };
     load();
-  }, [isLoaded, isSignedIn, user]);
+  }, [isLoaded, isSignedIn, user?.id]);
 
   const handleSignOut = async () => { await signOut(); router.push("/"); };
 

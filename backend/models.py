@@ -10,12 +10,14 @@ class User(Base):
     clerk_user_id   = Column(String, unique=True, index=True, nullable=False)  # Clerk's user_id
     email           = Column(String, index=True, nullable=True)
     full_name       = Column(String, nullable=True)
-    country         = Column(String, nullable=True)    # ISO 2-letter, e.g. "IN"
+    # Where the user SENDS FROM — the country they live or study in, and the
+    # country their university is in. ISO 2-letter, e.g. "GB".
+    country         = Column(String, nullable=True)
     university      = Column(String, nullable=True)
-    whatsapp_number = Column(String, nullable=True)
-    home_currency   = Column(String, nullable=True)    # e.g. "INR"
-    corridor_from   = Column(String, nullable=True)    # e.g. "GBP"
-    corridor_to     = Column(String, nullable=True)    # e.g. "INR"
+    whatsapp_number = Column(String, nullable=True)    # E.164, e.g. "+447700900123"
+    home_currency   = Column(String, nullable=True)    # currency they send home to, e.g. "INR"
+    corridor_from   = Column(String, nullable=True)    # currency of `country`, e.g. "GBP"
+    corridor_to     = Column(String, nullable=True)    # e.g. "INR" — never equal to corridor_from
     is_onboarded    = Column(Boolean, default=False)
     created_at      = Column(DateTime, default=datetime.utcnow)
     updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
