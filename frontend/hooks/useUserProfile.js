@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react";
-import { useAuth } from "@clerk/nextjs";
+import { useAuth } from "../contexts/AuthContext";
 import { getUserProfile, createUserProfile, checkUserStatus } from "../lib/api";
 
 export function useUserProfile() {

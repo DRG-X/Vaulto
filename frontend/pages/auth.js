@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/router";
-import { useSignIn, useSignUp, useAuth } from "@clerk/nextjs";
+import { useAuth, useSupabase } from "../contexts/AuthContext";
 import Head from "next/head";
 import Link from "next/link";
 
@@ -18,11 +18,24 @@ function getPasswordStrength(pw) {
   return score;
 }
 
+/**
+ * Where to land once the session exists.
+ *
+ * `redirect_to` is set by middleware.js when it turns someone away from a
+ * protected page. It is only honoured when it is a path on this site: an
+ * absolute URL here would turn the sign-in page into an open redirect, which
+ * is a ready-made phishing landing spot.
+ */
+function safeRedirect(target) {
+  if (typeof target !== "string") return null;
+  if (!target.startsWith("/") || target.startsWith("//")) return null;
+  return target;
+}
+
 export default function Auth() {
   const router = useRouter();
+  const supabase = useSupabase();
   const { isLoaded: authLoaded, isSignedIn } = useAuth();
-  const { isLoaded: signInLoaded, signIn, setActive: setSignInActive } = useSignIn();
-  const { isLoaded: signUpLoaded, signUp, setActive: setSignUpActive } = useSignUp();
 
   const [mode, setMode] = useState(MODE_LOGIN);
   const [email, setEmail] = useState("");
@@ -30,15 +43,22 @@ export default function Auth() {
   const [name, setName] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [forgotSent, setForgotSent] = useState(false);
+
+  const redirectTo = safeRedirect(router.query.redirect_to);
 
   useEffect(() => {
     if (router.query.mode === "signup") setMode(MODE_SIGNUP);
   }, [router.query.mode]);
 
   useEffect(() => {
-    if (authLoaded && isSignedIn) router.replace("/dashboard");
-  }, [authLoaded, isSignedIn]);
+    // post-auth decides between /dashboard and /onboarding; it also syncs the
+    // user row to the backend, so it must not be skipped on the way in.
+    if (authLoaded && isSignedIn) {
+      router.replace(redirectTo || "/post-auth");
+    }
+  }, [authLoaded, isSignedIn, redirectTo]);
 
   const passwordStrength = getPasswordStrength(password);
   const strengthLabels = ["", "Weak", "Fair", "Good", "Strong"];
@@ -47,32 +67,37 @@ export default function Auth() {
   const handleGoogleAuth = async () => {
     setError("");
     try {
-      const method = mode === MODE_SIGNUP ? signUp : signIn;
-      await method.authenticateWithRedirect({
-        strategy: "oauth_google",
-        redirectUrl: "/sso-callback",
-        redirectUrlComplete: "/post-auth",
+      // The browser client uses PKCE, so Google sends the user back with a
+      // `code` that only this browser can exchange. /sso-callback does the
+      // exchange and then hands off to /post-auth.
+      const callback = new URL("/sso-callback", window.location.origin);
+      if (redirectTo) callback.searchParams.set("redirect_to", redirectTo);
+
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: callback.toString() },
       });
+      if (oauthError) throw oauthError;
+      // On success the browser is navigating away; nothing to do here.
     } catch (e) {
-      setError(e.errors?.[0]?.message || "Google sign-in failed.");
+      setError(e.message || "Google sign-in failed.");
     }
   };
 
   const handleLogin = async (e) => {
     e.preventDefault();
-    if (!signInLoaded) return;
     setError("");
     setLoading(true);
     try {
-      const result = await signIn.create({ identifier: email, password });
-      if (result.status === "complete") {
-        await setSignInActive({ session: result.createdSessionId });
-        router.push("/post-auth");
-      } else {
-        setError("Additional verification required. Please check your email.");
-      }
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+      if (signInError) throw signInError;
+      // The AuthProvider picks the new session up and the effect above routes;
+      // pushing here too would race it.
     } catch (e) {
-      setError(e.errors?.[0]?.longMessage || e.errors?.[0]?.message || "Login failed.");
+      setError(e.message || "Login failed.");
     } finally {
       setLoading(false);
     }
@@ -80,22 +105,33 @@ export default function Auth() {
 
   const handleSignUp = async (e) => {
     e.preventDefault();
-    if (!signUpLoaded) return;
     setError("");
+    setNotice("");
     setLoading(true);
     try {
-      const parts = name.trim().split(" ");
-      const firstName = parts[0] || "";
-      const lastName = parts.slice(1).join(" ") || "";
-      const result = await signUp.create({ emailAddress: email, password, firstName, lastName });
-      if (result.status === "complete") {
-        await setSignUpActive({ session: result.createdSessionId });
-        router.push("/post-auth");
-      } else {
-        setError("Verification required. Check your email to continue.");
+      const { data, error: signUpError } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          // Stored on the user and read back through useUser().fullName.
+          data: { full_name: name.trim() },
+          emailRedirectTo: `${window.location.origin}/sso-callback`,
+        },
+      });
+      if (signUpError) throw signUpError;
+
+      // With "Confirm email" on (the Supabase default) no session is returned
+      // — the account exists but cannot sign in until the link is clicked.
+      // Saying so is the difference between "nothing happened" and "go check
+      // your inbox".
+      if (!data.session) {
+        setNotice(
+          `Almost there — we sent a confirmation link to ${email}. ` +
+          `Click it to finish creating your account.`
+        );
       }
     } catch (e) {
-      setError(e.errors?.[0]?.longMessage || e.errors?.[0]?.message || "Sign up failed.");
+      setError(e.message || "Sign up failed.");
     } finally {
       setLoading(false);
     }
@@ -103,14 +139,17 @@ export default function Auth() {
 
   const handleForgot = async (e) => {
     e.preventDefault();
-    if (!signInLoaded || !email) return;
+    if (!email) return;
     setError("");
     setLoading(true);
     try {
-      await signIn.create({ strategy: "reset_password_email_code", identifier: email });
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+      if (resetError) throw resetError;
       setForgotSent(true);
     } catch (e) {
-      setError(e.errors?.[0]?.message || "Failed to send reset email.");
+      setError(e.message || "Failed to send reset email.");
     } finally {
       setLoading(false);
     }
@@ -172,7 +211,7 @@ export default function Auth() {
                 <button
                   key={t.key}
                   className={`auth-tab ${mode === t.key ? "auth-tab-active" : ""}`}
-                  onClick={() => { setMode(t.key); setError(""); setForgotSent(false); }}
+                  onClick={() => { setMode(t.key); setError(""); setNotice(""); setForgotSent(false); }}
                   id={`auth-tab-${t.key}`}
                 >
                   {t.label}
@@ -240,6 +279,7 @@ export default function Auth() {
                       </div>
                     )}
                   </div>
+                  {notice && <div className="notice-box">{notice}</div>}
                   {error && <div className="error-box">{error}</div>}
                   <button type="submit" className="btn-secondary" style={{ width: "100%", justifyContent: "center", marginTop: "1rem" }} disabled={loading} id="signup-submit">
                     {loading ? "Creating account…" : "Create account →"}
@@ -395,6 +435,17 @@ export default function Auth() {
         .pw-bar { width: 30px; height: 3px; border-radius: 2px; transition: background 0.3s; }
 
         .forgot-success { text-align: center; padding: 1rem 0; }
+
+        .notice-box {
+          margin-top: 1rem;
+          padding: 0.75rem 1rem;
+          border-radius: var(--radius-md);
+          background: rgba(16, 185, 129, 0.1);
+          border: 1px solid rgba(16, 185, 129, 0.35);
+          color: var(--text);
+          font-size: 0.85rem;
+          line-height: 1.5;
+        }
 
         .auth-footer-links {
           display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;

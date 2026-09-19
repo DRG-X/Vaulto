@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { useRouter } from "next/router";
-import { useAuth, useUser, useClerk } from "@clerk/nextjs";
+import { useAuth, useUser } from "../contexts/AuthContext";
 
 /**
  * Nav — Reusable navigation bar.
@@ -11,9 +11,8 @@ import { useAuth, useUser, useClerk } from "@clerk/nextjs";
  */
 export default function Nav({ variant = "light", showDashboardLink = false }) {
   const router = useRouter();
-  const { isSignedIn } = useAuth();
+  const { isSignedIn, signOut } = useAuth();
   const { user } = useUser();
-  const { signOut } = useClerk();
   const [scrolled, setScrolled] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -28,9 +27,7 @@ export default function Nav({ variant = "light", showDashboardLink = false }) {
     router.push("/");
   };
 
-  const initials = user?.firstName
-    ? `${user.firstName[0]}${user.lastName?.[0] || ""}`.toUpperCase()
-    : "?";
+  const initials = user?.initials || "?";
 
   const navLinks = [
     { href: "/results?from=AUD&to=INR&amount=1000", label: "Compare" },

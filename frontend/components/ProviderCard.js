@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useAuth } from "@clerk/nextjs";
+import { useAuth } from "../contexts/AuthContext";
 import Link from "next/link";
 import CostBar from "./CostBar";
 import { saveComparison } from "../lib/api";

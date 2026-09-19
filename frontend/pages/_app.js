@@ -1,11 +1,11 @@
-import { ClerkProvider } from "@clerk/nextjs";
+import { AuthProvider } from "../contexts/AuthContext";
 import "../styles/globals.css";
 import "../styles/onboarding.css";
 
 export default function App({ Component, pageProps }) {
   return (
-    <ClerkProvider>
+    <AuthProvider>
       <Component {...pageProps} />
-    </ClerkProvider>
+    </AuthProvider>
   );
 }

@@ -19,6 +19,10 @@ import scheduler
 from notifications import EmailNotConfigured, EmailSendFailed
 
 
+#: A Supabase auth.users id is a UUID, not Clerk's "user_xxx".
+USER_ID = "3f0c9a7e-2b41-4d8e-9c1a-5f6b7c8d9e01"
+
+
 class FakeQuery:
     def __init__(self, result):
         self._result = result
@@ -50,7 +54,7 @@ class FakeSession:
 def make_alert(**kw):
     defaults = dict(
         id=1,
-        clerk_user_id="user_123",
+        supabase_user_id=USER_ID,
         from_currency="AUD",
         to_currency="INR",
         amount=1000.0,
@@ -67,14 +71,15 @@ def make_alert(**kw):
 
 
 def user(email="student@example.com"):
-    return SimpleNamespace(clerk_user_id="user_123", email=email)
+    return SimpleNamespace(supabase_user_id=USER_ID, email=email)
 
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     monkeypatch.delenv("RESEND_API_KEY", raising=False)
     monkeypatch.delenv("ALERT_FROM_EMAIL", raising=False)
-    monkeypatch.delenv("CLERK_SECRET_KEY", raising=False)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
 
 
 def transport(monkeypatch, handler):
@@ -168,9 +173,11 @@ class TestNotificationDispatch:
         self, monkeypatch
     ):
         """
-        THE original bug. Clerk's default session JWT carries no email claim,
-        so every user row was created with email=None, so this branch was
-        never taken — and it returned as though it had done its job.
+        THE original bug, inherited from Clerk: its default session JWT
+        carried no email claim, so every user row was created with email=None,
+        this branch was never taken — and it returned as though it had done its
+        job. A Supabase token does carry the address, so new rows have one;
+        the rows carried over from Clerk still do not.
         """
         monkeypatch.setattr(
             notifications, "send_email", _never_called
@@ -184,18 +191,19 @@ class TestNotificationDispatch:
         assert sent is False
 
     @pytest.mark.asyncio
-    async def test_a_missing_address_is_fetched_from_clerk(self, monkeypatch):
-        """The address exists — it is in Clerk, it was just never copied here."""
-        monkeypatch.setenv("CLERK_SECRET_KEY", "sk_test")
+    async def test_a_missing_address_is_fetched_from_supabase(self, monkeypatch):
+        """The address exists — it is in auth.users, it was just never copied here."""
+        monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+        monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "service_role_test")
+        seen = {}
 
         def handler(request):
-            if "api.clerk.com" in str(request.url):
+            if "/auth/v1/admin/users/" in str(request.url):
+                seen["url"] = str(request.url)
+                seen["apikey"] = request.headers.get("apikey")
                 return httpx.Response(200, json={
-                    "primary_email_address_id": "idn_2",
-                    "email_addresses": [
-                        {"id": "idn_1", "email_address": "old@example.com"},
-                        {"id": "idn_2", "email_address": "primary@example.com"},
-                    ],
+                    "id": USER_ID,
+                    "email": "primary@example.com",
                 })
             return httpx.Response(200, json={"id": "msg"})
 
@@ -210,6 +218,9 @@ class TestNotificationDispatch:
         )
 
         assert sent is True
+        # Asked Supabase about the right user, with the key GoTrue requires.
+        assert seen["url"].endswith(f"/auth/v1/admin/users/{USER_ID}")
+        assert seen["apikey"] == "service_role_test"
         # Persisted, so the next alert does not pay for the lookup again.
         assert db_user.email == "primary@example.com"
 

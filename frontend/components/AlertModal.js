@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { useAuth } from "@clerk/nextjs";
+import { useAuth } from "../contexts/AuthContext";
 import { CURRENCIES } from "../lib/currencies";
 import { createAlert, updateAlert, listProviders } from "../lib/api";
 import { railLabel } from "../lib/format";

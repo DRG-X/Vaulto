@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/router";
-import { useAuth, useUser } from "@clerk/nextjs";
+import { useAuth, useUser } from "../contexts/AuthContext";
 import { useUserProfile } from "../hooks/useUserProfile";
 import { syncUser } from "../lib/api";
 import Head from "next/head";
@@ -25,8 +25,8 @@ export default function PostAuth() {
       }, 10000);
 
       try {
-        // Retry getToken up to 3 times with 500ms delay — new OAuth sessions
-        // need an extra tick before the token is available
+        // Retry getToken a few times — a session written by the OAuth
+        // callback needs a tick to reach the cookie this reads from.
         let token = null;
         for (let attempt = 0; attempt < 3; attempt++) {
           token = await getToken();
@@ -40,10 +40,12 @@ export default function PostAuth() {
           return;
         }
 
+        // The backend re-reads all three from the verified token; sending them
+        // only covers a project with a custom claims hook that strips them.
         await syncUser(token, {
-          clerk_id:  user.id,
-          email:     user.primaryEmailAddress?.emailAddress || "",
-          full_name: user.fullName || user.username || "",
+          supabase_id: user.id,
+          email:       user.email || "",
+          full_name:   user.fullName || "",
         });
 
         const { exists, is_onboarded } = await checkStatus();

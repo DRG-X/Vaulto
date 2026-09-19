@@ -216,15 +216,21 @@ class ProviderListResponse(BaseModel):
 # ── User schemas ──────────────────────────────────────────────────────────────
 
 class UserSync(BaseModel):
-    """Called after Clerk sign-up to upsert the user row."""
-    clerk_id: str
-    email: str
+    """
+    Called after Supabase sign-up / sign-in to upsert the user row.
+
+    `supabase_id` is echoed back by the client and checked against the token's
+    own `sub` before anything is written — it is a consistency check, never the
+    thing that decides whose row is touched.
+    """
+    supabase_id: str
+    email: Optional[str] = None
     full_name: Optional[str] = None
 
 
 class UserRead(BaseModel):
     id: int
-    clerk_user_id: str
+    supabase_user_id: str
     email: Optional[str] = None
     full_name: Optional[str] = None
     country: Optional[str] = None
@@ -272,7 +278,7 @@ class ProfileCreate(BaseModel):
 
 class ProfileResponse(BaseModel):
     id: int
-    clerk_user_id: str
+    supabase_user_id: str
     email: Optional[str] = None
     country: Optional[str] = None
     university: Optional[str] = None
@@ -285,7 +291,7 @@ class ProfileResponse(BaseModel):
 
 
 class UserStatusResponse(BaseModel):
-    """Lightweight check — does this Clerk user already have a saved profile?"""
+    """Lightweight check — does this Supabase user already have a saved profile?"""
     exists: bool
     is_onboarded: bool = False
 
@@ -301,7 +307,7 @@ class ComparisonCreate(BaseModel):
 
 class ComparisonRead(BaseModel):
     id: int
-    clerk_user_id: Optional[str] = None
+    supabase_user_id: Optional[str] = None
     amount: float
     from_currency: str
     to_currency: str
@@ -334,7 +340,7 @@ class RateAlertCreate(BaseModel):
 
 class RateAlertRead(BaseModel):
     id: int
-    clerk_user_id: str
+    supabase_user_id: str
     from_currency: str
     to_currency: str
     amount: float

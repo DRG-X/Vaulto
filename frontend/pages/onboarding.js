@@ -5,7 +5,7 @@ import Link from "next/link";
 import { COUNTRIES, UNIVERSITIES } from "../lib/universities";
 import { PHONE_CODES } from "../lib/countryPhoneCodes";
 import { COUNTRY_CURRENCY_MAP } from "../lib/currencies";
-import { useAuth } from "@clerk/nextjs";
+import { useAuth } from "../contexts/AuthContext";
 import { useUserProfile } from "../hooks/useUserProfile";
 import { completeOnboarding } from "../lib/api";
 import SearchableDropdown from "../components/SearchableDropdown";

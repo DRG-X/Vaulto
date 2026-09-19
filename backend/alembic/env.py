@@ -15,11 +15,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # access to the values within the .ini file in use.
 config = context.config
 
-# Override sqlalchemy.url from the environment (supports Railway's postgres:// prefix)
-_db_url = os.getenv("DATABASE_URL", "sqlite:///./flint.db")
+# Override sqlalchemy.url from the environment.
+#
+# DIRECT_URL wins when it is set. Supabase's transaction pooler (port 6543)
+# hands each statement to whichever backend is free, which is right for a
+# stateless API and wrong for a migration: DDL here runs inside one
+# transaction and relies on session state. DIRECT_URL is the session-mode or
+# direct connection string to run migrations over. With only DATABASE_URL set,
+# that is what is used and everything still works.
+_db_url = os.getenv("DIRECT_URL") or os.getenv("DATABASE_URL", "sqlite:///./flint.db")
 if _db_url.startswith("postgres://"):
     _db_url = _db_url.replace("postgres://", "postgresql://", 1)
-config.set_main_option("sqlalchemy.url", _db_url)
+# Escaped because Alembic runs the value through ConfigParser interpolation,
+# where a literal % in a URL-encoded password would otherwise blow up.
+config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
@@ -29,7 +38,7 @@ if config.config_file_name is not None:
 # add your model's MetaData object here
 # for 'autogenerate' support
 from database import Base  # noqa: E402
-from models import User, Comparison, RateAlert  # noqa: E402, F401
+from models import User, Comparison, RateAlert, ProviderClick  # noqa: E402, F401
 target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,
