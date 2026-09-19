@@ -1,17 +1,16 @@
 import logging
 import datetime
-import base64
 
-import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.orm import Session
 
+import clerk
+import notifications
 from database import SessionLocal
 from models import RateAlert, User
 from engine.comparator import QuotePools, fetch_pools
 from cache import get_cached_rates, set_cached_rates
 from money import D
-import os
 
 logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
@@ -107,15 +106,14 @@ async def check_alerts():
                             "Alert %s triggered: %s at %.4f >= %.4f",
                             alert.id, quote.provider, quote.exchange_rate, alert.target_rate,
                         )
-                        await send_alert_notification(
-                            alert, quote.exchange_rate, quote.provider, db
-                        )
-                        alert.last_triggered = datetime.datetime.utcnow()
-                        alert.is_active = False  # auto-pause after first trigger to prevent spam
-                        db.commit()
+                        await _fire(alert, quote.exchange_rate, quote.provider, db)
 
             except Exception as exc:
-                logger.error("Alert check failed for %s→%s: %s", from_cur, to_cur, exc)
+                # Roll back before the next corridor: a failed commit leaves
+                # the session in a state where every later query raises, so
+                # one bad corridor used to take out the rest of the run.
+                db.rollback()
+                logger.exception("Alert check failed for %s→%s: %s", from_cur, to_cur, exc)
 
     finally:
         db.close()
@@ -123,14 +121,73 @@ async def check_alerts():
     logger.info("Alert checker: run complete")
 
 
+async def _fire(alert: RateAlert, rate: float, provider: str, db) -> bool:
+    """
+    Deliver a triggered alert and pause it — but only if delivery worked.
+
+    The alert used to be paused unconditionally, right after a notification
+    call that swallowed its own errors. A missing API key or an unverified
+    sending domain therefore consumed the alert AND sent nothing: the user
+    lost the notification and the watch that would have produced the next one,
+    silently. An alert is the user's property; a failure on our side must not
+    spend it.
+
+    Returns True when the user was actually notified.
+    """
+    sent = await send_alert_notification(alert, rate, provider, db)
+
+    if not sent:
+        logger.error(
+            "Alert %s hit its target but could not be delivered — leaving it "
+            "active to retry on the next run",
+            alert.id,
+        )
+        return False
+
+    alert.last_triggered = datetime.datetime.utcnow()
+    alert.is_active = False  # auto-pause after a DELIVERED trigger, to prevent spam
+    db.commit()
+    return True
+
+
+async def _address_for(alert: RateAlert, user: User, db) -> str:
+    """
+    The address to mail, looking it up in Clerk if we never captured one.
+
+    See clerk.py: the session token has no email claim by default, so
+    `user.email` is NULL for accounts created through the normal sign-up path.
+    The address is not missing — it was never copied across. Persisting what
+    we find means the lookup happens once per user, not once per alert.
+    """
+    if user.email:
+        return user.email
+
+    address = await clerk.fetch_primary_email(alert.clerk_user_id)
+    if not address:
+        return ""
+
+    user.email = address
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("Could not persist the email address for %s", alert.clerk_user_id)
+    return address
+
+
 async def send_alert_notification(
     alert: RateAlert, current_rate: float, provider: str, db: Session
-) -> None:
-    """Send email notification when a target rate is reached."""
+) -> bool:
+    """
+    Notify the user that their target was reached.
+
+    Returns True only when a notification actually went out. The caller uses
+    that to decide whether the alert has been spent.
+    """
     user = db.query(User).filter(User.clerk_user_id == alert.clerk_user_id).first()
     if not user:
         logger.warning("Alert %s: no user found for clerk_user_id=%s", alert.id, alert.clerk_user_id)
-        return
+        return False
 
     # Describe what was ACTUALLY watched. A provider- or rail-scoped alert is
     # not a claim about the market: saying "best provider right now: Wise"
@@ -151,7 +208,7 @@ async def send_alert_notification(
     )
 
     message = (
-        f"🎯 Rate Alert Hit!\n\n"
+        f"\U0001f3af Rate Alert Hit!\n\n"
         f"Your target: 1 {alert.from_currency} = {alert.target_rate} {alert.to_currency}\n"
         f"{rate_line}\n"
         f"Send money now at vaulto.in"
@@ -159,29 +216,44 @@ async def send_alert_notification(
         f"Visit https://vaulto.in/alerts to re-enable it or set a new target."
     )
 
-    if alert.notify_email and user.email:
-        await send_email_notification(user.email, message, alert)
+    if alert.notify_whatsapp and not alert.notify_email:
+        # The UI offers this toggle; nothing implements it. Saying so is better
+        # than returning True and letting the alert be marked delivered.
+        logger.error(
+            "Alert %s asked for WhatsApp only, which is not implemented — "
+            "no notification sent",
+            alert.id,
+        )
+        return False
 
+    if not alert.notify_email:
+        logger.warning("Alert %s has no enabled notification channel", alert.id)
+        return False
 
-async def send_email_notification(email: str, message: str, alert: RateAlert) -> None:
-    """Send via Resend (free tier: 100 emails/day, 3 000/month)."""
-    import resend  # lazy import — only needed when emails fire
-
-    resend.api_key = os.getenv("RESEND_API_KEY", "")
-    if not resend.api_key:
-        logger.warning("RESEND_API_KEY not set — email not sent")
-        return
+    address = await _address_for(alert, user, db)
+    if not address:
+        logger.error(
+            "Alert %s triggered but no email address is on file for %s, and "
+            "Clerk did not supply one — nothing sent",
+            alert.id, alert.clerk_user_id,
+        )
+        return False
 
     try:
-        resend.Emails.send({
-            "from": "alerts@vaulto.in",
-            "to": email,
-            "subject": f"Rate alert triggered — {alert.from_currency}→{alert.to_currency} (now paused)",
-            "text": message,
-        })
-        logger.info("Email notification sent to %s for alert %s", email, alert.id)
-    except Exception as exc:
-        logger.error("Email send failed for alert %s: %s", alert.id, exc)
+        await notifications.send_email(
+            address,
+            f"Rate alert triggered \u2014 {alert.from_currency}\u2192{alert.to_currency} (now paused)",
+            message,
+        )
+    except notifications.EmailNotConfigured as exc:
+        logger.error("Alert %s: %s", alert.id, exc)
+        return False
+    except notifications.EmailSendFailed as exc:
+        logger.error("Alert %s: email delivery failed \u2014 %s", alert.id, exc)
+        return False
+
+    logger.info("Alert %s delivered to %s", alert.id, address)
+    return True
 
 
 def start_scheduler() -> None:

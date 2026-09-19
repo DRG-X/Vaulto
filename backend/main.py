@@ -639,6 +639,16 @@ def create_alert(
     user_auth: dict = Depends(verify_clerk_token),
     db: Session = Depends(get_db)
 ):
+    # WhatsApp is offered by the model and the UI but nothing delivers it, so
+    # an alert with WhatsApp as its only channel can never be delivered. It
+    # would fire, fail to notify, and stay armed forever. Refuse it at the
+    # door rather than storing a watch that cannot pay off.
+    if body.notify_whatsapp and not body.notify_email:
+        raise HTTPException(
+            status_code=400,
+            detail="WhatsApp alerts are not available yet. Enable email notification.",
+        )
+
     alert = models.RateAlert(
         clerk_user_id   = user_auth["clerk_user_id"],
         from_currency   = body.from_currency.upper(),
@@ -687,8 +697,18 @@ def update_alert(
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    updates = body.model_dump(exclude_unset=True)
+    for field, value in updates.items():
         setattr(alert, field, value)
+
+    # Same rule as creation, applied to the resulting state: an edit must not
+    # be able to leave an alert with no channel that can actually deliver.
+    if alert.notify_whatsapp and not alert.notify_email:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="WhatsApp alerts are not available yet. Enable email notification.",
+        )
 
     try:
         db.commit()
