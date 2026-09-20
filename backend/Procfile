@@ -1,0 +1,3 @@
+# One worker: a second would run a second copy of the alert scheduler and every
+# alert would fire twice. See the note in Dockerfile.
+web: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --proxy-headers --forwarded-allow-ips='*'

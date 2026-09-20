@@ -1,4 +1,8 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Trailing slashes are stripped because every call below appends an absolute
+// path: a URL pasted as "https://api.example.com/" would otherwise produce
+// "https://api.example.com//compare", which some proxies 404 and others
+// redirect in a way that drops the Authorization header.
+const API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/+$/, "");
 
 // ── Auth helper ────────────────────────────────────────────────────────────────
 

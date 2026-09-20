@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Depends, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
@@ -54,14 +55,38 @@ logger = logging.getLogger("flint")
 
 
 
-def run_migrations() -> None:
-    """
-    Bring an EXISTING database up to head.
+#: The tables this app owns. Their presence is how an existing database is told
+#: apart from an empty one.
+APP_TABLES = frozenset({"users", "comparisons", "rate_alerts", "provider_clicks"})
 
-    `create_all` only creates tables that are missing — it will never ALTER one
-    that already exists. So a column added in a migration (rate_alerts.
-    pay_out_method) appears on a fresh database and is silently absent on every
-    deployed one, where the next query then fails with "no such column".
+#: The last revision whose work `create_all` also does (it creates every table).
+#: An unstamped schema is adopted here so that only the later ALTERs replay.
+ADOPT_REVISION = "0b82c2271300"
+
+
+def init_schema() -> None:
+    """
+    Get the database to the shape the models expect, whatever state it is in.
+
+    Three states have to be handled, and conflating them is how this used to
+    fail on the one that matters most:
+
+    * **Already under Alembic** (`alembic_version` present) — upgrade to head.
+      The ordinary redeploy.
+    * **Empty** — upgrade to head as well. The migrations build every table
+      themselves, so nothing else is needed. This is the path that was broken:
+      `create_all` ran FIRST and created the tables, and then the very first
+      migration died on `CREATE TABLE users` with "table users already exists",
+      which meant no new deployment could start at all.
+    * **Tables but no `alembic_version`** — a schema built by `create_all`
+      alone. Its tables exist but nothing recorded which migrations that
+      accounts for, so replaying them from the start would collide. It is
+      stamped at the point where the table-creating work ends and then upgraded,
+      so only the later column changes run.
+
+    `create_all` still runs afterwards, as the safety net it was meant to be:
+    it adds a table a model declares before anyone has written a migration for
+    it, and it is a no-op for everything else.
 
     Failure is logged loudly and re-raised: serving an API whose schema does
     not match its models means every affected request 500s at runtime, which is
@@ -83,13 +108,31 @@ def run_migrations() -> None:
         sys.path[0:0] = shadowing
     cfg = Config(os.path.join(here, "alembic.ini"))
     cfg.set_main_option("script_location", os.path.join(here, "alembic"))
+    # This process already configured logging; alembic.ini would reset the root
+    # logger to WARN and take the app's own output with it. See alembic/env.py.
+    cfg.attributes["configure_logger"] = False
     # Alembic's own env.py reads DATABASE_URL, but be explicit so a mismatch
     # between the app's engine and the migration target is impossible.
     cfg.set_main_option("sqlalchemy.url", str(engine.url).replace("%", "%%"))
 
     try:
+        existing = set(sa_inspect(engine).get_table_names())
+        managed = "alembic_version" in existing
+        app_tables_present = bool(existing & APP_TABLES)
+
+        if not managed and app_tables_present:
+            logger.info(
+                "Existing tables with no Alembic history — adopting them at %s",
+                ADOPT_REVISION,
+            )
+            command.stamp(cfg, ADOPT_REVISION)
+
         command.upgrade(cfg, "head")
         logger.info("Database schema is at head")
+
+        # Safety net, and deliberately AFTER the migrations: on an empty
+        # database they are what creates the tables.
+        Base.metadata.create_all(bind=engine)
     except Exception:
         logger.exception(
             "Database migration failed — the schema does not match the models. "
@@ -104,9 +147,8 @@ async def lifespan(app: FastAPI):
     """Initialise shared resources on startup; clean up on shutdown."""
     await init_cache()   # connect Redis + PING test
     from models import User, Comparison, RateAlert, ProviderClick  # noqa — ensures models registered
-    Base.metadata.create_all(bind=engine)           # safety net: create tables if not present
-    run_migrations()                                 # ALTERs that create_all cannot do
-    logger.info("CORS allowed origins: %s", ALLOWED_ORIGINS)
+    init_schema()        # migrate to head, then create_all as a safety net
+    logger.info("CORS allowed origins: %s (regex=%s)", ALLOWED_ORIGINS, ALLOWED_ORIGIN_REGEX)
     start_scheduler()    # background alert checker — every 15 min
     yield
     stop_scheduler()     # graceful shutdown
@@ -121,11 +163,35 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+def _origins(raw: str) -> list[str]:
+    """
+    Parse ALLOWED_ORIGINS into a list a browser can actually match.
+
+    Whitespace is stripped because `a.com, b.com` — with the space a person
+    naturally types after the comma — otherwise yields " b.com", which matches
+    no Origin header that will ever arrive. The failure is invisible from the
+    server side: the request is served, the browser discards the response, and
+    the frontend reports a network error.
+
+    A trailing slash is stripped for the same reason: an Origin header is a
+    scheme, host and port, never a path, so `https://app.com/` never matches.
+    """
+    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+
+
+ALLOWED_ORIGINS = _origins(
+    os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+)
+
+#: Optional regex for origins that cannot be listed because their hostname is
+#: generated — Vercel preview deployments, whose URL contains the branch and
+#: commit. Example: ALLOWED_ORIGIN_REGEX=https://vaulto-[a-z0-9-]+\.vercel\.app
+ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX") or "").strip() or None
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -154,10 +220,6 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "flint-api"}
-
-# @app.get("/user/onboarding" , response_model = UserStatusResponse)
-# def onboarding_status(
-    
 
 @app.get("/user/status", response_model=UserStatusResponse)
 def get_user_status(

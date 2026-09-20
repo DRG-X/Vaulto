@@ -58,10 +58,22 @@ async def init_cache() -> None:
     logger.info("CACHE STEP: REDIS_URL present=%s  length=%d", bool(REDIS_URL), len(REDIS_URL))
 
     if not REDIS_URL:
-        logger.warning(
-            "CACHE STEP: REDIS_URL not set — caching disabled. "
-            "Set REDIS_URL in .env to enable Redis caching."
-        )
+        # A REST URL is not a Redis URL. Upstash publishes both, and this
+        # client speaks the Redis protocol, so the REST pair cannot be used
+        # here — naming them is what turns a silently cache-less deployment
+        # into a one-line fix.
+        if os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_REDIS_REST_TOKEN"):
+            logger.warning(
+                "CACHE STEP: UPSTASH_REDIS_REST_* is set but REDIS_URL is not — "
+                "caching disabled. This client needs the Redis-protocol URL, not "
+                "the REST endpoint: copy the `rediss://…` string from the Upstash "
+                "database page (Connect → redis-cli / ioredis) into REDIS_URL."
+            )
+        else:
+            logger.warning(
+                "CACHE STEP: REDIS_URL not set — caching disabled. "
+                "Set REDIS_URL to a redis:// or rediss:// URL to enable caching."
+            )
         return
 
     try:

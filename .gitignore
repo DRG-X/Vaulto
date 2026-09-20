@@ -29,3 +29,5 @@ Thumbs.db
 
 # Misc
 *.log
+# Test caches
+.pytest_cache/

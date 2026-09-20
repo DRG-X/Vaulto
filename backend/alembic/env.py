@@ -30,10 +30,24 @@ if _db_url.startswith("postgres://"):
 # where a literal % in a URL-encoded password would otherwise blow up.
 config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
 
-# Interpret the config file for Python logging.
-# This line sets up loggers basically.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# Interpret the config file for Python logging — but ONLY when Alembic is being
+# run as a command-line tool.
+#
+# `init_schema()` in main.py also loads this env.py, in-process, on every
+# startup, and there `fileConfig` is actively harmful: it resets the root logger
+# to the ini's `level = WARN` and swaps its handler, so the API logged its
+# migrations and then went quiet for the rest of its life — no request log, no
+# alert-checker output, no INFO diagnostics. Nothing looked broken, which is
+# what made it expensive.
+#
+# main.py therefore sets `configure_logger = False` (Alembic's own convention for
+# this) and keeps the logging it set up. Alembic's "Running upgrade …" lines are
+# not lost: the `alembic` logger propagates to that handler instead.
+#
+# disable_existing_loggers=False covers the CLI path, where the app's loggers may
+# also already exist — silencing them is never what is wanted.
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # add your model's MetaData object here
 # for 'autogenerate' support

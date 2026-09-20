@@ -2,6 +2,13 @@
 
 Flint is a real-time comparison tool that fetches live quotes from **Wise**, **Remitly**, and **Western Union**, then tells you exactly which provider gives your recipient the most money.
 
+**Deploying?** Start with **[DEPLOYMENT.md](DEPLOYMENT.md)** for the ordered
+steps, and **[ENVIRONMENT.md](ENVIRONMENT.md)** for every environment variable
+and where in each dashboard to find it. Short version: frontend on Vercel,
+database and auth on Supabase, and the FastAPI backend on a container host
+(Render / Railway / Fly) because its alert scheduler needs a process that stays
+alive.
+
 ---
 
 ## Architecture Overview
@@ -561,10 +568,20 @@ responses before trusting a deploy.
 
 ## Deployment
 
+Full walkthrough: **[DEPLOYMENT.md](DEPLOYMENT.md)**. Every environment
+variable, and where to get it: **[ENVIRONMENT.md](ENVIRONMENT.md)**. What
+follows is the shape of it.
+
+The backend does **not** go on Vercel. Its rate-alert checker is an in-process
+scheduler that has to be alive between 15-minute ticks, it migrates the database
+at startup, and one comparison fans out to 28 provider APIs — none of which
+survives a serverless function that is frozen between requests.
+
 ### Database + auth (Supabase)
 
 Managed — nothing to deploy. Point the backend at the project and it migrates
-itself on startup. See [Supabase (database + auth)](#supabase-database--auth).
+itself on startup, Row Level Security included. See
+[Supabase (database + auth)](#supabase-database--auth).
 
 ### Backend (Render / Fly.io / Railway / anywhere that runs a container)
 

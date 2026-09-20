@@ -160,9 +160,16 @@ def _rename(old: str, new: str) -> None:
 
     # SQLite (local development and the test suite). `users` first — see TABLES.
     children = _child_tables(old, new)
+    existing_indexes = {
+        ix["name"] for ix in sa.inspect(bind).get_indexes("users")
+    } if "users" in targets else set()
     for table in targets:
         if table == "users":
-            op.drop_index(f"ix_users_{old}", table_name="users")
+            # Conditional for the same reason the Postgres branch uses
+            # IF EXISTS: a hand-built or partially-migrated database may carry
+            # the column without the index, and dropping blind fails there.
+            if f"ix_users_{old}" in existing_indexes:
+                op.drop_index(f"ix_users_{old}", table_name="users")
             with op.batch_alter_table("users", copy_from=_users_table(old)) as batch:
                 batch.alter_column(old, new_column_name=new)
             op.create_index(f"ix_users_{new}", "users", [new], unique=True)
