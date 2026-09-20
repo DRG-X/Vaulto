@@ -1,12 +1,23 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/router";
 import { useAuth, useSupabase } from "../contexts/AuthContext";
 import Head from "next/head";
 import Link from "next/link";
+import { redirectFromQuery, withRedirect } from "../lib/redirect";
 
-const MODE_LOGIN = "login";
+const MODE_LOGIN  = "login";
 const MODE_SIGNUP = "signup";
 const MODE_FORGOT = "forgot";
+
+// Sub-steps inside a mode. Every one of these used to be a dead end: the code
+// was sent, and the screen had nowhere to type it.
+const STEP_FORM    = "form";        // email + password
+const STEP_VERIFY  = "verify";      // sign-up: confirm the emailed code
+const STEP_RESET   = "reset";       // forgot: emailed code + new password
+const STEP_FACTOR  = "factor";      // sign-in: emailed code (passwordless)
+const STEP_2FA     = "2fa";         // sign-in: the enrolled MFA factor
+
+const RESEND_SECONDS = 30;
 
 function getPasswordStrength(pw) {
   if (!pw) return 0;
@@ -19,17 +30,59 @@ function getPasswordStrength(pw) {
 }
 
 /**
- * Where to land once the session exists.
+ * Turn a Supabase auth error into something a person can act on.
  *
- * `redirect_to` is set by middleware.js when it turns someone away from a
- * protected page. It is only honoured when it is a path on this site: an
- * absolute URL here would turn the sign-in page into an open redirect, which
- * is a ready-made phishing landing spot.
+ * GoTrue's raw messages are accurate and unhelpful ("Invalid login
+ * credentials"), and the default here used to be a flat "Login failed." that
+ * told the user nothing about what to do next. `error.code` is the stable
+ * handle — the message text is not, so it is only ever the last resort.
  */
-function safeRedirect(target) {
-  if (typeof target !== "string") return null;
-  if (!target.startsWith("/") || target.startsWith("//")) return null;
-  return target;
+function readAuthError(e, fallback) {
+  const code = e?.code || e?.error_code;
+  switch (code) {
+    case "invalid_credentials":
+      return "That email and password don't match an account. Try again, or reset your password.";
+    case "user_not_found":
+      return "We couldn't find an account with that email. Try signing up instead.";
+    case "email_not_confirmed":
+      return "Your email isn't confirmed yet. Enter the code we just sent to finish.";
+    case "user_already_exists":
+    case "email_exists":
+      return "An account with this email already exists — log in instead.";
+    case "weak_password":
+      return "That password is too easy to guess. Mix in another word, number or symbol.";
+    case "same_password":
+      return "That's the password you already have. Pick a different one.";
+    case "otp_expired":
+      return "That code has expired. Send a new one and try again.";
+    case "otp_disabled":
+      return "Email codes are turned off for this project. Use your password instead.";
+    case "over_email_send_rate_limit":
+      return "We've sent a few emails already. Wait a minute, then ask for another.";
+    case "over_request_rate_limit":
+    case "too_many_requests":
+      return "Too many attempts. Wait a minute, then try again.";
+    case "signup_disabled":
+      return "New accounts are closed at the moment. Please try again later.";
+    case "provider_disabled":
+    case "oauth_provider_not_supported":
+      return "That sign-in method isn't enabled. Use your email and password instead.";
+    case "validation_failed":
+      return "That email doesn't look right. Check it and try again.";
+    case "captcha_failed":
+      return "We couldn't complete the security check. Reload the page and try again.";
+    case "mfa_verification_failed":
+      return "That code isn't right. Check the digits, or wait for the next one.";
+    case "mfa_challenge_expired":
+      return "That two-step prompt expired. Sign in again to get a new one.";
+    default:
+      break;
+  }
+  // A 422 from GoTrue on a sign-up is almost always the password rule.
+  if (e?.status === 422 && /password/i.test(e?.message || "")) {
+    return "Passwords need to be at least 8 characters.";
+  }
+  return e?.message || fallback;
 }
 
 export default function Auth() {
@@ -38,122 +91,478 @@ export default function Auth() {
   const { isLoaded: authLoaded, isSignedIn } = useAuth();
 
   const [mode, setMode] = useState(MODE_LOGIN);
+  const [step, setStep] = useState(STEP_FORM);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [name, setName] = useState("");
+  const [code, setCode] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [secondFactor, setSecondFactor] = useState(null);   // { factorId, challengeId, label, isPhone }
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [forgotSent, setForgotSent] = useState(false);
+  const [resendIn, setResendIn] = useState(0);
 
-  const redirectTo = safeRedirect(router.query.redirect_to);
+  // Set once we have a session and are on our way out. Without it, the
+  // "already signed in" effect below races the redirect we just started and
+  // can win — which is how a fresh sign-up used to land on /dashboard with no
+  // account row behind it, skipping onboarding entirely.
+  const leaving = useRef(false);
+
+  // Set for as long as THIS page is driving a flow. A password sign-in against
+  // an account with two-step verification creates a real (aal1) session before
+  // the second factor is asked for, so the effect below would see
+  // `isSignedIn` and redirect straight past the prompt. While we are driving,
+  // only the handlers decide when to leave.
+  const driving = useRef(false);
+
+  const destination = redirectFromQuery(router.query, "/dashboard");
+  const postAuthUrl = withRedirect("/post-auth", destination);
 
   useEffect(() => {
     if (router.query.mode === "signup") setMode(MODE_SIGNUP);
+    else if (router.query.mode === "login") setMode(MODE_LOGIN);
   }, [router.query.mode]);
 
+  // Already signed in (came back to /auth with a live session)? There is
+  // nothing to do here — post-auth decides between onboarding and dashboard.
   useEffect(() => {
-    // post-auth decides between /dashboard and /onboarding; it also syncs the
-    // user row to the backend, so it must not be skipped on the way in.
-    if (authLoaded && isSignedIn) {
-      router.replace(redirectTo || "/post-auth");
+    if (authLoaded && isSignedIn && !leaving.current && !driving.current) {
+      leaving.current = true;
+      router.replace(postAuthUrl);
     }
-  }, [authLoaded, isSignedIn, redirectTo]);
+  }, [authLoaded, isSignedIn, postAuthUrl]);
 
-  const passwordStrength = getPasswordStrength(password);
+  // Resend cooldown
+  useEffect(() => {
+    if (resendIn <= 0) return;
+    const t = setTimeout(() => setResendIn(s => s - 1), 1000);
+    return () => clearTimeout(t);
+  }, [resendIn]);
+
+  const finish = useCallback(() => {
+    leaving.current = true;
+    router.replace(postAuthUrl);
+  }, [router, postAuthUrl]);
+
+  const emailRedirectTo = () =>
+    typeof window === "undefined"
+      ? undefined
+      : new URL(withRedirect("/sso-callback", destination), window.location.origin).toString();
+
+  const switchMode = (next) => {
+    setMode(next);
+    setStep(STEP_FORM);
+    setError("");
+    setNotice("");
+    setCode("");
+    setNewPassword("");
+    setSecondFactor(null);
+    driving.current = false;
+  };
+
+  const passwordStrength = getPasswordStrength(mode === MODE_FORGOT ? newPassword : password);
   const strengthLabels = ["", "Weak", "Fair", "Good", "Strong"];
   const strengthColors = ["", "#ef4444", "#f59e0b", "#3b82f6", "#10b981"];
+  const busy = loading || googleLoading;
 
+  /**
+   * Ask for the enrolled second factor, if this session still owes one.
+   *
+   * Supabase grades a session's assurance level: a password gets you `aal1`,
+   * and an account with a verified factor needs `aal2`. The gap between them is
+   * exactly "signed in, but not all the way", and it is what this step closes.
+   * Returns true when a prompt is now on screen.
+   */
+  const beginSecondFactor = async () => {
+    const { data: aal, error: aalError } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+    if (aalError) throw aalError;
+    if (!aal || aal.nextLevel !== "aal2" || aal.nextLevel === aal.currentLevel) return false;
+
+    const { data: factorData, error: listError } = await supabase.auth.mfa.listFactors();
+    if (listError) throw listError;
+    const factors = factorData?.all || factorData?.totp || [];
+    const factor = factors.find(f => f.status === "verified") || factors[0];
+    // An account that owes aal2 with nothing to challenge cannot be rescued
+    // from this screen; letting it through beats stranding it here.
+    if (!factor) return false;
+
+    const { data: challenge, error: challengeError } =
+      await supabase.auth.mfa.challenge({ factorId: factor.id });
+    if (challengeError) throw challengeError;
+
+    const isPhone = factor.factor_type === "phone";
+    setSecondFactor({
+      factorId: factor.id,
+      challengeId: challenge.id,
+      isPhone,
+      label: isPhone
+        ? "We texted a code to your phone."
+        : "Enter the code from your authenticator app.",
+    });
+    setStep(STEP_2FA);
+    setNotice("");
+    return true;
+  };
+
+  /** A session exists — go on to the second factor, or leave. */
+  const completeSession = async () => {
+    if (await beginSecondFactor()) return;
+    finish();
+  };
+
+  // ── Google ────────────────────────────────────────────────────────────────
   const handleGoogleAuth = async () => {
     setError("");
+    setGoogleLoading(true);
+    driving.current = true;
     try {
       // The browser client uses PKCE, so Google sends the user back with a
       // `code` that only this browser can exchange. /sso-callback does the
       // exchange and then hands off to /post-auth.
-      const callback = new URL("/sso-callback", window.location.origin);
-      if (redirectTo) callback.searchParams.set("redirect_to", redirectTo);
-
       const { error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: "google",
-        options: { redirectTo: callback.toString() },
+        options: { redirectTo: emailRedirectTo() },
       });
       if (oauthError) throw oauthError;
       // On success the browser is navigating away; nothing to do here.
     } catch (e) {
-      setError(e.message || "Google sign-in failed.");
+      driving.current = false;
+      setGoogleLoading(false);
+      setError(readAuthError(e, "Google sign-in failed. Please try again."));
     }
   };
 
+  // ── Sign-in ───────────────────────────────────────────────────────────────
   const handleLogin = async (e) => {
     e.preventDefault();
+    if (loading) return;
     setError("");
+    setNotice("");
     setLoading(true);
+    driving.current = true;
     try {
       const { error: signInError } = await supabase.auth.signInWithPassword({
-        email,
+        email: email.trim(),
         password,
       });
       if (signInError) throw signInError;
-      // The AuthProvider picks the new session up and the effect above routes;
-      // pushing here too would race it.
-    } catch (e) {
-      setError(e.message || "Login failed.");
+      await completeSession();
+    } catch (err) {
+      driving.current = false;
+      // The account exists but its email was never confirmed. Send the code
+      // and show the box for it, rather than reporting a dead end.
+      if (err?.code === "email_not_confirmed") {
+        try {
+          await supabase.auth.resend({
+            type: "signup",
+            email: email.trim(),
+            options: { emailRedirectTo: emailRedirectTo() },
+          });
+          setStep(STEP_VERIFY);
+          setMode(MODE_SIGNUP);
+          setNotice(`Your email isn't confirmed yet — we sent a new code to ${email.trim()}.`);
+          setResendIn(RESEND_SECONDS);
+          return;
+        } catch (resendErr) {
+          setError(readAuthError(resendErr, "Your email isn't confirmed yet."));
+          return;
+        }
+      }
+      setError(readAuthError(err, "We couldn't sign you in. Please try again."));
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSignUp = async (e) => {
-    e.preventDefault();
+  /** Passwordless: email a one-time code instead of asking for the password. */
+  const handleEmailCode = async () => {
+    if (loading || !email.trim()) {
+      setError("Enter your email first, and we'll send you a code.");
+      return;
+    }
     setError("");
     setNotice("");
     setLoading(true);
     try {
+      const { error: otpError } = await supabase.auth.signInWithOtp({
+        email: email.trim(),
+        // This is the sign-IN path: an unknown address should be told so, not
+        // quietly turned into a half-finished account.
+        options: { shouldCreateUser: false, emailRedirectTo: emailRedirectTo() },
+      });
+      if (otpError) throw otpError;
+      setStep(STEP_FACTOR);
+      setNotice(`We sent a 6-digit code to ${email.trim()}.`);
+      setResendIn(RESEND_SECONDS);
+    } catch (err) {
+      setError(readAuthError(err, "We couldn't send a code. Please try again."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleFirstFactorCode = async (e) => {
+    e.preventDefault();
+    if (loading) return;
+    setError("");
+    setLoading(true);
+    driving.current = true;
+    try {
+      const { error: verifyError } = await supabase.auth.verifyOtp({
+        email: email.trim(),
+        token: code.trim(),
+        type: "email",
+      });
+      if (verifyError) throw verifyError;
+      await completeSession();
+    } catch (err) {
+      driving.current = false;
+      setError(readAuthError(err, "That code isn't right. Please try again."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSecondFactor = async (e) => {
+    e.preventDefault();
+    if (loading || !secondFactor) return;
+    setError("");
+    setLoading(true);
+    try {
+      const { error: verifyError } = await supabase.auth.mfa.verify({
+        factorId: secondFactor.factorId,
+        challengeId: secondFactor.challengeId,
+        code: code.trim(),
+      });
+      if (verifyError) throw verifyError;
+      finish();
+    } catch (err) {
+      setError(readAuthError(err, "That code isn't right. Please try again."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Sign-up ───────────────────────────────────────────────────────────────
+  const handleSignUp = async (e) => {
+    e.preventDefault();
+    if (loading) return;
+    setError("");
+    setNotice("");
+
+    if (password.length < 8) {
+      setError("Passwords need to be at least 8 characters.");
+      return;
+    }
+
+    setLoading(true);
+    driving.current = true;
+    try {
       const { data, error: signUpError } = await supabase.auth.signUp({
-        email,
+        email: email.trim(),
         password,
         options: {
           // Stored on the user and read back through useUser().fullName.
           data: { full_name: name.trim() },
-          emailRedirectTo: `${window.location.origin}/sso-callback`,
+          emailRedirectTo: emailRedirectTo(),
         },
       });
       if (signUpError) throw signUpError;
 
-      // With "Confirm email" on (the Supabase default) no session is returned
-      // — the account exists but cannot sign in until the link is clicked.
-      // Saying so is the difference between "nothing happened" and "go check
-      // your inbox".
-      if (!data.session) {
-        setNotice(
-          `Almost there — we sent a confirmation link to ${email}. ` +
-          `Click it to finish creating your account.`
-        );
+      // Supabase will not admit that an address is already taken — it returns
+      // a user with no identities instead, to stop the form being used to
+      // enumerate accounts. That shape is the only signal we get.
+      if (data?.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        driving.current = false;
+        setMode(MODE_LOGIN);
+        setStep(STEP_FORM);
+        setError("You already have an account with this email — sign in below.");
+        return;
       }
-    } catch (e) {
-      setError(e.message || "Sign up failed.");
+
+      // Email confirmation off: the session is live and we are done.
+      if (data?.session) {
+        await completeSession();
+        return;
+      }
+
+      // The normal path for a project that confirms email: show the box to
+      // type the code into. This is the step that was missing — sign-up
+      // simply stopped here with "check your email".
+      driving.current = false;
+      setStep(STEP_VERIFY);
+      setNotice(`We sent a 6-digit code to ${email.trim()}.`);
+      setResendIn(RESEND_SECONDS);
+    } catch (err) {
+      driving.current = false;
+      setError(readAuthError(err, "We couldn't create your account. Please try again."));
     } finally {
       setLoading(false);
     }
   };
 
-  const handleForgot = async (e) => {
+  const handleVerifyEmail = async (e) => {
     e.preventDefault();
-    if (!email) return;
+    if (loading) return;
     setError("");
     setLoading(true);
+    driving.current = true;
     try {
-      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${window.location.origin}/reset-password`,
+      const { error: verifyError } = await supabase.auth.verifyOtp({
+        email: email.trim(),
+        token: code.trim(),
+        type: "signup",
       });
-      if (resetError) throw resetError;
-      setForgotSent(true);
-    } catch (e) {
-      setError(e.message || "Failed to send reset email.");
+      if (verifyError) throw verifyError;
+      await completeSession();
+    } catch (err) {
+      driving.current = false;
+      setError(readAuthError(err, "That code isn't right. Please try again."));
     } finally {
       setLoading(false);
     }
   };
+
+  const handleResend = async () => {
+    if (resendIn > 0 || loading) return;
+    setError("");
+    setLoading(true);
+    try {
+      if (step === STEP_VERIFY) {
+        const { error: resendError } = await supabase.auth.resend({
+          type: "signup",
+          email: email.trim(),
+          options: { emailRedirectTo: emailRedirectTo() },
+        });
+        if (resendError) throw resendError;
+      } else if (step === STEP_RESET) {
+        const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+          redirectTo: `${window.location.origin}/reset-password`,
+        });
+        if (resetError) throw resetError;
+      } else {
+        const { error: otpError } = await supabase.auth.signInWithOtp({
+          email: email.trim(),
+          options: { shouldCreateUser: false, emailRedirectTo: emailRedirectTo() },
+        });
+        if (otpError) throw otpError;
+      }
+      setNotice(`We sent a new code to ${email.trim()}.`);
+      setResendIn(RESEND_SECONDS);
+    } catch (err) {
+      setError(readAuthError(err, "We couldn't send another code just yet."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Forgot password ───────────────────────────────────────────────────────
+  const handleForgot = async (e) => {
+    e.preventDefault();
+    if (loading || !email.trim()) return;
+    setError("");
+    setNotice("");
+    setLoading(true);
+    try {
+      // The recovery email carries both a link and a code. The link lands on
+      // /reset-password; the code is typed in on the next step here, so
+      // whichever one the user reaches for works.
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+      if (resetError) throw resetError;
+      setStep(STEP_RESET);
+      setNotice(`We sent a 6-digit code to ${email.trim()}.`);
+      setResendIn(RESEND_SECONDS);
+    } catch (err) {
+      setError(readAuthError(err, "We couldn't send a reset code. Please try again."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleReset = async (e) => {
+    e.preventDefault();
+    if (loading) return;
+    setError("");
+
+    if (newPassword.length < 8) {
+      setError("Your new password needs to be at least 8 characters.");
+      return;
+    }
+
+    setLoading(true);
+    driving.current = true;
+    try {
+      // The code buys a session; that session is what authorises the change.
+      const { error: verifyError } = await supabase.auth.verifyOtp({
+        email: email.trim(),
+        token: code.trim(),
+        type: "recovery",
+      });
+      if (verifyError) throw verifyError;
+
+      const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+      if (updateError) throw updateError;
+
+      await completeSession();
+    } catch (err) {
+      driving.current = false;
+      setError(readAuthError(err, "We couldn't reset your password. Please try again."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Shared pieces ─────────────────────────────────────────────────────────
+  // A recovery or authenticator code is always six digits here, so the box is
+  // digits-only — pasting a formatted code still lands correctly.
+  const codeField = (labelId) => (
+    <div className="field">
+      <label htmlFor={labelId}>6-digit code</label>
+      <input
+        id={labelId}
+        className="code-input"
+        type="text"
+        inputMode="numeric"
+        autoComplete="one-time-code"
+        maxLength={6}
+        value={code}
+        onChange={e => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+        placeholder="123456"
+        required
+        autoFocus
+      />
+    </div>
+  );
+
+  const codeIncomplete = code.length < 6;
+
+  const resendRow = (
+    <div className="resend-row">
+      <span>Didn&rsquo;t get it?</span>
+      <button type="button" onClick={handleResend} disabled={resendIn > 0 || loading} className="forgot-link">
+        {resendIn > 0 ? `Resend in ${resendIn}s` : "Send a new code"}
+      </button>
+    </div>
+  );
+
+  const feedback = (
+    <>
+      {notice && <div className="notice-box" role="status">{notice}</div>}
+      {error && <div className="error-box" role="alert">{error}</div>}
+    </>
+  );
+
+  const heading =
+    step === STEP_VERIFY ? "Verify your email"
+    : step === STEP_RESET ? "Choose a new password"
+    : step === STEP_FACTOR ? "Check your email"
+    : step === STEP_2FA ? "Two-step verification"
+    : null;
 
   return (
     <>
@@ -211,8 +620,10 @@ export default function Auth() {
                 <button
                   key={t.key}
                   className={`auth-tab ${mode === t.key ? "auth-tab-active" : ""}`}
-                  onClick={() => { setMode(t.key); setError(""); setNotice(""); setForgotSent(false); }}
+                  onClick={() => switchMode(t.key)}
+                  disabled={busy}
                   id={`auth-tab-${t.key}`}
+                  type="button"
                 >
                   {t.label}
                 </button>
@@ -220,14 +631,17 @@ export default function Auth() {
             </div>
 
             <div className="auth-form-card">
-              {/* Google OAuth */}
-              {mode !== MODE_FORGOT && (
+              {heading && <h3 className="auth-step-title">{heading}</h3>}
+
+              {/* Google OAuth — only on the first step of login/signup */}
+              {step === STEP_FORM && mode !== MODE_FORGOT && (
                 <>
                   <button
                     className="google-btn"
                     onClick={handleGoogleAuth}
-                    disabled={loading}
+                    disabled={busy}
                     id="auth-google-btn"
+                    type="button"
                   >
                     <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
                       <path d="M17.64 9.205c0-.639-.057-1.252-.164-1.841H9v3.481h4.844a4.14 4.14 0 01-1.796 2.716v2.259h2.908c1.702-1.567 2.684-3.875 2.684-6.615z" fill="#4285F4"/>
@@ -235,39 +649,79 @@ export default function Auth() {
                       <path d="M3.964 10.71A5.41 5.41 0 013.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 000 9c0 1.452.348 2.827.957 4.042l3.007-2.332z" fill="#FBBC05"/>
                       <path d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 00.957 4.958L3.964 7.29C4.672 5.163 6.656 3.58 9 3.58z" fill="#EA4335"/>
                     </svg>
-                    Continue with Google
+                    {googleLoading ? "Opening Google…" : "Continue with Google"}
                   </button>
                   <div className="auth-divider"><span>or</span></div>
                 </>
               )}
 
-              {/* Login form */}
-              {mode === MODE_LOGIN && (
+              {/* ── Login ── */}
+              {mode === MODE_LOGIN && step === STEP_FORM && (
                 <form onSubmit={handleLogin}>
-                  <div className="field"><label htmlFor="login-email">Email</label>
-                    <input id="login-email" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required /></div>
-                  <div className="field" style={{ marginTop: "1rem" }}><label htmlFor="login-password">Password</label>
-                    <input id="login-password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" required /></div>
-                  <div style={{ textAlign: "right", marginTop: "0.5rem" }}>
-                    <button type="button" onClick={() => setMode(MODE_FORGOT)} className="forgot-link">Forgot password?</button>
+                  <div className="field">
+                    <label htmlFor="login-email">Email</label>
+                    <input id="login-email" type="email" autoComplete="email" value={email}
+                           onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required />
                   </div>
-                  {error && <div className="error-box">{error}</div>}
-                  <button type="submit" className="btn-secondary" style={{ width: "100%", justifyContent: "center", marginTop: "1rem" }} disabled={loading} id="login-submit">
+                  <div className="field" style={{ marginTop: "1rem" }}>
+                    <label htmlFor="login-password">Password</label>
+                    <div className="pw-wrap">
+                      <input id="login-password" type={showPassword ? "text" : "password"}
+                             autoComplete="current-password" value={password}
+                             onChange={e => setPassword(e.target.value)} placeholder="••••••••" required />
+                      <button type="button" className="pw-toggle" onClick={() => setShowPassword(v => !v)}
+                              aria-label={showPassword ? "Hide password" : "Show password"}>
+                        {showPassword ? "Hide" : "Show"}
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right", marginTop: "0.5rem" }}>
+                    <button type="button" onClick={() => switchMode(MODE_FORGOT)} className="forgot-link">
+                      Forgot password?
+                    </button>
+                  </div>
+                  {feedback}
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy} id="login-submit">
                     {loading ? "Signing in…" : "Sign in →"}
                   </button>
+                  <p className="auth-swap">
+                    <button type="button" className="forgot-link" onClick={handleEmailCode} disabled={busy} id="login-email-code">
+                      Email me a code instead
+                    </button>
+                  </p>
+                  <p className="auth-swap">
+                    New to Vaulto?{" "}
+                    <button type="button" className="forgot-link" onClick={() => switchMode(MODE_SIGNUP)}>
+                      Create an account
+                    </button>
+                  </p>
                 </form>
               )}
 
-              {/* Sign up form */}
-              {mode === MODE_SIGNUP && (
+              {/* ── Sign up ── */}
+              {mode === MODE_SIGNUP && step === STEP_FORM && (
                 <form onSubmit={handleSignUp}>
-                  <div className="field"><label htmlFor="su-name">Full name</label>
-                    <input id="su-name" type="text" value={name} onChange={e => setName(e.target.value)} placeholder="Alex Johnson" required /></div>
-                  <div className="field" style={{ marginTop: "1rem" }}><label htmlFor="su-email">Email</label>
-                    <input id="su-email" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required /></div>
+                  <div className="field">
+                    <label htmlFor="su-name">Full name</label>
+                    <input id="su-name" type="text" autoComplete="name" value={name}
+                           onChange={e => setName(e.target.value)} placeholder="Alex Johnson" required />
+                  </div>
+                  <div className="field" style={{ marginTop: "1rem" }}>
+                    <label htmlFor="su-email">Email</label>
+                    <input id="su-email" type="email" autoComplete="email" value={email}
+                           onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required />
+                  </div>
                   <div className="field" style={{ marginTop: "1rem" }}>
                     <label htmlFor="su-password">Password</label>
-                    <input id="su-password" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" required />
+                    <div className="pw-wrap">
+                      <input id="su-password" type={showPassword ? "text" : "password"}
+                             autoComplete="new-password" minLength={8} value={password}
+                             onChange={e => setPassword(e.target.value)} placeholder="At least 8 characters" required />
+                      <button type="button" className="pw-toggle" onClick={() => setShowPassword(v => !v)}
+                              aria-label={showPassword ? "Hide password" : "Show password"}>
+                        {showPassword ? "Hide" : "Show"}
+                      </button>
+                    </div>
                     {password && (
                       <div className="pw-strength">
                         <div className="pw-bars">
@@ -279,48 +733,137 @@ export default function Auth() {
                       </div>
                     )}
                   </div>
-                  {notice && <div className="notice-box">{notice}</div>}
-                  {error && <div className="error-box">{error}</div>}
-                  <button type="submit" className="btn-secondary" style={{ width: "100%", justifyContent: "center", marginTop: "1rem" }} disabled={loading} id="signup-submit">
+                  {feedback}
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy} id="signup-submit">
                     {loading ? "Creating account…" : "Create account →"}
+                  </button>
+                  <p className="auth-swap">
+                    Already have an account?{" "}
+                    <button type="button" className="forgot-link" onClick={() => switchMode(MODE_LOGIN)}>
+                      Log in
+                    </button>
+                  </p>
+                </form>
+              )}
+
+              {/* ── Sign up: email verification ── */}
+              {mode === MODE_SIGNUP && step === STEP_VERIFY && (
+                <form onSubmit={handleVerifyEmail}>
+                  <p className="auth-step-copy">
+                    Enter the code we emailed you to finish creating your account —
+                    or just click the link in that email.
+                  </p>
+                  {codeField("verify-code")}
+                  {feedback}
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy || codeIncomplete} id="verify-submit">
+                    {loading ? "Verifying…" : "Verify email →"}
+                  </button>
+                  {resendRow}
+                  <button type="button" className="btn-ghost auth-back" onClick={() => switchMode(MODE_SIGNUP)}>
+                    ← Use a different email
                   </button>
                 </form>
               )}
 
-              {/* Forgot password */}
-              {mode === MODE_FORGOT && (
-                forgotSent ? (
-                  <div className="forgot-success">
-                    <div style={{ fontSize: "2rem", marginBottom: "0.75rem" }}>📬</div>
-                    <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700 }}>Check your email</h3>
-                    <p style={{ color: "var(--muted)", fontSize: "0.875rem", marginTop: "0.5rem" }}>
-                      We sent a reset link to {email}. Follow the instructions to reset your password.
-                    </p>
-                    <button className="btn-ghost" onClick={() => { setMode(MODE_LOGIN); setForgotSent(false); }} style={{ marginTop: "1rem", width: "100%", justifyContent: "center" }}>
-                      Back to login
-                    </button>
+              {/* ── Login: emailed code (passwordless) ── */}
+              {mode === MODE_LOGIN && step === STEP_FACTOR && (
+                <form onSubmit={handleFirstFactorCode}>
+                  <p className="auth-step-copy">Enter the code we emailed you to continue.</p>
+                  {codeField("factor-code")}
+                  {feedback}
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy || codeIncomplete} id="factor-submit">
+                    {loading ? "Checking…" : "Continue →"}
+                  </button>
+                  {resendRow}
+                  <button type="button" className="btn-ghost auth-back" onClick={() => switchMode(MODE_LOGIN)}>
+                    ← Back to login
+                  </button>
+                </form>
+              )}
+
+              {/* ── Login: second factor ── */}
+              {step === STEP_2FA && (
+                <form onSubmit={handleSecondFactor}>
+                  <p className="auth-step-copy">{secondFactor?.label}</p>
+                  {codeField("twofa-code")}
+                  {feedback}
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy || codeIncomplete} id="twofa-submit">
+                    {loading ? "Checking…" : "Verify →"}
+                  </button>
+                  <button type="button" className="btn-ghost auth-back" onClick={() => switchMode(MODE_LOGIN)}>
+                    ← Back to login
+                  </button>
+                </form>
+              )}
+
+              {/* ── Forgot: ask for the email ── */}
+              {mode === MODE_FORGOT && step === STEP_FORM && (
+                <form onSubmit={handleForgot}>
+                  <p className="auth-step-copy">
+                    Enter your email and we&rsquo;ll send you a code to set a new password.
+                  </p>
+                  <div className="field">
+                    <label htmlFor="forgot-email">Email</label>
+                    <input id="forgot-email" type="email" autoComplete="email" value={email}
+                           onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required />
                   </div>
-                ) : (
-                  <form onSubmit={handleForgot}>
-                    <p style={{ color: "var(--text-mid)", fontSize: "0.875rem", marginBottom: "1rem" }}>
-                      Enter your email and we'll send you a link to reset your password.
-                    </p>
-                    <div className="field"><label htmlFor="forgot-email">Email</label>
-                      <input id="forgot-email" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required /></div>
-                    {error && <div className="error-box">{error}</div>}
-                    <button type="submit" className="btn-secondary" style={{ width: "100%", justifyContent: "center", marginTop: "1rem" }} disabled={loading} id="forgot-submit">
-                      {loading ? "Sending…" : "Send Reset Link →"}
-                    </button>
-                  </form>
-                )
+                  {feedback}
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy} id="forgot-submit">
+                    {loading ? "Sending…" : "Send reset code →"}
+                  </button>
+                  <button type="button" className="btn-ghost auth-back" onClick={() => switchMode(MODE_LOGIN)}>
+                    ← Back to login
+                  </button>
+                </form>
+              )}
+
+              {/* ── Forgot: code + new password ── */}
+              {mode === MODE_FORGOT && step === STEP_RESET && (
+                <form onSubmit={handleReset}>
+                  <p className="auth-step-copy">
+                    Enter the code we emailed you and pick a new password.
+                  </p>
+                  {codeField("reset-code")}
+                  <div className="field" style={{ marginTop: "1rem" }}>
+                    <label htmlFor="reset-password">New password</label>
+                    <div className="pw-wrap">
+                      <input id="reset-password" type={showPassword ? "text" : "password"}
+                             autoComplete="new-password" minLength={8} value={newPassword}
+                             onChange={e => setNewPassword(e.target.value)}
+                             placeholder="At least 8 characters" required />
+                      <button type="button" className="pw-toggle" onClick={() => setShowPassword(v => !v)}
+                              aria-label={showPassword ? "Hide password" : "Show password"}>
+                        {showPassword ? "Hide" : "Show"}
+                      </button>
+                    </div>
+                    {newPassword && (
+                      <div className="pw-strength">
+                        <div className="pw-bars">
+                          {[1,2,3,4].map(n => (
+                            <div key={n} className="pw-bar" style={{ background: n <= passwordStrength ? strengthColors[passwordStrength] : "var(--surface-high)" }} />
+                          ))}
+                        </div>
+                        <span style={{ fontSize: "0.7rem", color: strengthColors[passwordStrength] }}>{strengthLabels[passwordStrength]}</span>
+                      </div>
+                    )}
+                  </div>
+                  {feedback}
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy || codeIncomplete} id="reset-submit">
+                    {loading ? "Saving…" : "Set new password →"}
+                  </button>
+                  {resendRow}
+                  <button type="button" className="btn-ghost auth-back" onClick={() => switchMode(MODE_LOGIN)}>
+                    ← Back to login
+                  </button>
+                </form>
               )}
 
               {/* Footer */}
               <div className="auth-footer-links">
                 <span>🔒 256-bit encrypted</span>
-                <Link href="#">Privacy</Link>
-                <Link href="#">Terms</Link>
-                <Link href="#">Security</Link>
+                <Link href="/privacy">Privacy</Link>
+                <Link href="/terms">Terms</Link>
+                <Link href="/cookies">Cookies</Link>
               </div>
             </div>
           </div>
@@ -399,6 +942,7 @@ export default function Auth() {
           transition: color 0.15s, border-color 0.15s;
         }
         .auth-tab:hover { color: var(--text); }
+        .auth-tab:disabled { opacity: 0.6; cursor: not-allowed; }
         .auth-tab-active { color: var(--secondary) !important; border-bottom-color: var(--secondary); }
 
         .auth-form-card {
@@ -406,6 +950,17 @@ export default function Auth() {
           border-radius: var(--radius-xl);
           padding: 2rem;
           box-shadow: var(--shadow-md);
+        }
+
+        .auth-step-title {
+          font-family: var(--font-display);
+          font-size: 1.15rem; font-weight: 800;
+          letter-spacing: -0.02em;
+          margin-bottom: 0.35rem;
+        }
+        .auth-step-copy {
+          color: var(--text-mid); font-size: 0.875rem;
+          line-height: 1.5; margin-bottom: 1.25rem;
         }
 
         .google-btn {
@@ -427,24 +982,53 @@ export default function Auth() {
         }
         .auth-divider::before, .auth-divider::after { content: ""; flex: 1; height: 1px; background: var(--surface-high); }
 
+        .auth-submit {
+          width: 100%; justify-content: center; margin-top: 1rem;
+        }
+        .auth-back {
+          width: 100%; justify-content: center; margin-top: 0.75rem;
+        }
+        .auth-swap {
+          text-align: center; margin-top: 1rem;
+          font-size: 0.8rem; color: var(--muted);
+        }
+
         .forgot-link { background: none; border: none; color: var(--secondary); font-size: 0.8rem; cursor: pointer; font-family: var(--font-body); }
-        .forgot-link:hover { text-decoration: underline; }
+        .forgot-link:hover:not(:disabled) { text-decoration: underline; }
+        .forgot-link:disabled { color: var(--muted); cursor: not-allowed; }
+
+        .pw-wrap { position: relative; display: flex; }
+        .pw-wrap input { width: 100%; padding-right: 3.75rem; }
+        .pw-toggle {
+          position: absolute; right: 0.6rem; top: 50%; transform: translateY(-50%);
+          background: none; border: none; cursor: pointer;
+          font-family: var(--font-body); font-size: 0.75rem; font-weight: 600;
+          color: var(--muted);
+        }
+        .pw-toggle:hover { color: var(--text); }
 
         .pw-strength { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
         .pw-bars { display: flex; gap: 3px; }
         .pw-bar { width: 30px; height: 3px; border-radius: 2px; transition: background 0.3s; }
 
-        .forgot-success { text-align: center; padding: 1rem 0; }
+        .code-input {
+          font-family: var(--font-display);
+          font-size: 1.5rem; font-weight: 700;
+          letter-spacing: 0.4em; text-align: center;
+        }
+
+        .resend-row {
+          display: flex; align-items: center; justify-content: center; gap: 0.4rem;
+          margin-top: 0.9rem; font-size: 0.8rem; color: var(--muted);
+        }
 
         .notice-box {
-          margin-top: 1rem;
-          padding: 0.75rem 1rem;
+          background: var(--tertiary-dim);
+          color: var(--tertiary);
           border-radius: var(--radius-md);
-          background: rgba(16, 185, 129, 0.1);
-          border: 1px solid rgba(16, 185, 129, 0.35);
-          color: var(--text);
-          font-size: 0.85rem;
-          line-height: 1.5;
+          padding: 0.7rem 0.9rem;
+          font-size: 0.8rem;
+          margin-top: 1rem;
         }
 
         .auth-footer-links {

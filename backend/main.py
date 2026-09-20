@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Depends, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRouter
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from pydantic import ValidationError
 
@@ -192,31 +193,34 @@ def create_user_profile(
     db: Session = Depends(get_db)
 ):
     user_id = user_auth["user_id"]
-    user = db.query(models.User).filter(models.User.supabase_user_id == user_id).first()
+    existing = db.query(models.User).filter(
+        models.User.supabase_user_id == user_id
+    ).first()
+    is_new_user = existing is None
 
-    if user:
-        user.is_new_user = False
-        return user
-
-    new_user = models.User(
-        supabase_user_id=user_id,
+    # A returning user re-posting their profile used to get their own stale row
+    # back with nothing saved — the edit silently vanished. Write it either way.
+    user = upsert_user(
+        db,
+        user_id,
         email=user_auth.get("email"),
-        country=profile_data.country,
-        university=profile_data.university,
-        whatsapp_number=profile_data.whatsapp_number,
-        is_onboarded=True,
+        full_name=user_auth.get("full_name"),
     )
-    db.add(new_user)
+    user.country         = profile_data.country
+    user.university      = profile_data.university
+    user.whatsapp_number = profile_data.whatsapp_number
+    user.is_onboarded    = True
+
     try:
         db.commit()
-        db.refresh(new_user)
+        db.refresh(user)
     except Exception:
         db.rollback()
-        logger.exception("Failed to insert user profile for user_id=%s", user_id)
+        logger.exception("Failed to save user profile for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Database insertion failed")
 
-    new_user.is_new_user = True
-    return new_user
+    user.is_new_user = is_new_user
+    return user
 
 
 @app.post("/compare", response_model=CompareResponse)
@@ -254,50 +258,86 @@ async def submit_contact(body: ContactMessage):
 
 users_router = APIRouter(prefix="/api/users", tags=["users"])
 
-@users_router.post("/sync", response_model=UserRead)
-def sync_user(body: UserSync, user_auth: dict = Depends(verify_supabase_token), db: Session = Depends(get_db)):
+def upsert_user(db: Session, user_id: str, email: Optional[str] = None,
+                full_name: Optional[str] = None) -> models.User:
     """
-    Called after Supabase sign-up/sign-in from post-auth.js.
-    Creates the user row if it doesn't exist, returns the user either way.
+    Get-or-create the row for a Supabase user, and keep name/email current.
+
+    Sign-in fans out: post-auth syncs, and the dashboard syncs again as a
+    safety net. Both can be in flight at once, so the INSERT can lose the race
+    against the unique index on `supabase_user_id`. Catching that and re-reading
+    turns what used to be a 500 on the user's very first screen into the same
+    row the other request just wrote.
+
+    An address that has since changed in Supabase is the one that can still
+    receive mail, so email overwrites rather than back-fills.
     """
-    user_id = user_auth["user_id"]
-    if body.supabase_id != user_id:
-        raise HTTPException(status_code=403, detail="Cannot sync another user's account")
-
-    # The token is the authority on both fields. The body is what the browser
-    # believes, and a browser can be told anything; the claims were signed by
-    # Supabase. Falling back to the body only covers the case where a custom
-    # access-token hook has stripped a claim.
-    email = user_auth.get("email") or body.email
-    full_name = user_auth.get("full_name") or body.full_name
-
     user = db.query(models.User).filter(models.User.supabase_user_id == user_id).first()
     if user:
-        if full_name and not user.full_name:
+        changed = False
+        if full_name and user.full_name != full_name:
             user.full_name = full_name
-        # An address that has since changed in Supabase is the one that can
-        # still receive mail, so this overwrites rather than back-filling.
+            changed = True
         if email and user.email != email:
             user.email = email
-        db.commit()
-        db.refresh(user)
+            changed = True
+        if changed:
+            db.commit()
+            db.refresh(user)
         return user
 
-    new_user = models.User(
+    user = models.User(
         supabase_user_id=user_id,
         email=email,
         full_name=full_name,
         is_onboarded=False,
     )
-    db.add(new_user)
+    db.add(user)
     try:
         db.commit()
-        db.refresh(new_user)
+    except IntegrityError:
+        # A concurrent sync inserted the same row first — adopt it.
+        db.rollback()
+        existing = db.query(models.User).filter(
+            models.User.supabase_user_id == user_id
+        ).first()
+        if existing is None:
+            raise
+        return existing
+    db.refresh(user)
+    return user
+
+
+@users_router.post("/sync", response_model=UserRead)
+def sync_user(body: UserSync, user_auth: dict = Depends(verify_supabase_token), db: Session = Depends(get_db)):
+    """
+    Called after Supabase sign-up/sign-in from post-auth.js.
+    Creates the user row if it doesn't exist, returns the user either way.
+
+    The row is keyed off the verified token, not the body. A client that has
+    not yet hydrated its Supabase user object sends no id, and still syncs the
+    account it is authenticated as; only an explicitly WRONG id is refused.
+
+    The token is the authority on email and name. The body is what the browser
+    believes, and a browser can be told anything; the claims were signed by
+    Supabase. Falling back to the body only covers the case where a custom
+    access-token hook has stripped a claim.
+    """
+    user_id = user_auth["user_id"]
+    if body.supabase_id and body.supabase_id != user_id:
+        raise HTTPException(status_code=403, detail="Cannot sync another user's account")
+
+    try:
+        return upsert_user(
+            db,
+            user_id,
+            email=user_auth.get("email") or body.email,
+            full_name=user_auth.get("full_name") or body.full_name,
+        )
     except Exception:
         db.rollback()
         logger.exception("sync_user: failed for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Failed to sync user")
-    return new_user
 
 
 @users_router.get("/me", response_model=UserRead)
@@ -325,7 +365,19 @@ def update_me(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    for field, value in body.model_dump(exclude_unset=True).items():
+    updates = body.model_dump(exclude_unset=True)
+
+    # A partial update can still produce an impossible corridor by changing one
+    # leg to match the stored other leg. Validate the MERGED pair, not the patch.
+    merged_from = updates.get("corridor_from", user.corridor_from)
+    merged_to   = updates.get("corridor_to",   user.corridor_to)
+    if merged_from and merged_to and merged_from == merged_to:
+        raise HTTPException(
+            status_code=422,
+            detail="Send and receive currencies must be different.",
+        )
+
+    for field, value in updates.items():
         setattr(user, field, value)
 
     try:
@@ -358,16 +410,14 @@ def complete_onboarding(
     Called on final step submit of the onboarding wizard.
     """
     user_id = user_auth["user_id"]
-    user = db.query(models.User).filter(models.User.supabase_user_id == user_id).first()
-
-    if not user:
-        # Auto-create if sync call was missed
-        user = models.User(
-            supabase_user_id=user_id,
-            email=user_auth.get("email"),
-            full_name=user_auth.get("full_name"),
-        )
-        db.add(user)
+    # Auto-creates the row if the sync call was missed, so onboarding can never
+    # dead-end on "user not found" after the user has filled the whole wizard.
+    user = upsert_user(
+        db,
+        user_id,
+        email=user_auth.get("email"),
+        full_name=user_auth.get("full_name"),
+    )
 
     user.country         = body.country
     user.university      = body.university

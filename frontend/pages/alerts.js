@@ -8,6 +8,7 @@ import Footer from "../components/Footer";
 import { railLabel } from "../lib/format";
 import AlertModal from "../components/AlertModal";
 import { listAlerts, updateAlert, deleteAlert, getMe } from "../lib/api";
+import { signInPath } from "../lib/redirect";
 
 export default function Alerts() {
   const router = useRouter();
@@ -23,7 +24,7 @@ export default function Alerts() {
 
   useEffect(() => {
     if (!isLoaded) return;
-    if (!isSignedIn) { router.replace("/auth"); return; }
+    if (!isSignedIn) { router.replace(signInPath(router.asPath)); return; }
     loadData();
   }, [isLoaded, isSignedIn]);
 
@@ -32,10 +33,21 @@ export default function Alerts() {
     setError("");
     try {
       const token = await getToken();
-      const [alts, me] = await Promise.all([listAlerts(token), getMe(token)]);
-      setAlerts(Array.isArray(alts) ? alts : []);
-      setProfile(me);
+      const [altsResult, meResult] = await Promise.allSettled([listAlerts(token), getMe(token)]);
+
+      const profileErr = meResult.status === "rejected" ? meResult.reason : null;
+      if (profileErr?.status === 401) { router.replace(signInPath(router.asPath)); return; }
+      // No profile row yet — they never finished onboarding. Alerts need a
+      // corridor to watch, so send them to finish rather than showing them
+      // "User not found" on a page that can't work without it.
+      if (profileErr?.status === 404) { router.replace("/onboarding?redirect_url=%2Falerts"); return; }
+
+      if (altsResult.status === "rejected") throw altsResult.reason;
+      setAlerts(Array.isArray(altsResult.value) ? altsResult.value : []);
+      if (meResult.status === "fulfilled") setProfile(meResult.value);
+      if (profileErr) setError("We couldn't load your profile — alerts are shown, but defaults may be off.");
     } catch (e) {
+      if (e?.status === 401) { router.replace(signInPath(router.asPath)); return; }
       setError(e.message || "Failed to load alerts.");
     } finally {
       setLoading(false);

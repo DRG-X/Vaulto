@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/router";
 import Head from "next/head";
 import { useSupabase } from "../contexts/AuthContext";
+import { redirectFromQuery, withRedirect } from "../lib/redirect";
 
 /**
  * Where Google (and the email-confirmation link) send the user back to.
@@ -16,6 +17,12 @@ import { useSupabase } from "../contexts/AuthContext";
  *                        link templates. The client picks that up on its own
  *                        via detectSessionInUrl, so there is nothing to do but
  *                        wait for the session to appear.
+ *
+ * It then hands off to /post-auth and never straight to /dashboard: post-auth
+ * is what creates the user row and decides between onboarding and the
+ * dashboard. Sending OAuth users past both is how a brand-new Google sign-up
+ * used to land on a dashboard with no profile behind it. Where they were
+ * originally headed rides along in `redirect_url`.
  */
 export default function SSOCallback() {
   const router = useRouter();
@@ -52,12 +59,7 @@ export default function SSOCallback() {
         }
       }
 
-      const target = router.query.redirect_to;
-      const safe =
-        typeof target === "string" && target.startsWith("/") && !target.startsWith("//")
-          ? target
-          : "/post-auth";
-      router.replace(safe);
+      router.replace(withRedirect("/post-auth", redirectFromQuery(router.query)));
     };
 
     finish();
@@ -68,10 +70,11 @@ export default function SSOCallback() {
       <Head>
         <title>Signing you in… — Vaulto</title>
       </Head>
+
       <div className="min-h-screen bg-[var(--bg)] flex flex-col items-center justify-center text-[var(--text)]">
         {error ? (
           <div className="text-center max-w-md w-full px-5">
-            <div className="error-box">{error}</div>
+            <div className="error-box" role="alert">{error}</div>
             <button className="btn-secondary mt-2" onClick={() => router.replace("/auth")}>
               Back to sign in
             </button>

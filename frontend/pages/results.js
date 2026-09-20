@@ -138,7 +138,9 @@ export default function Results() {
 
   const handleAlert = (provider) => {
     if (!isSignedIn) {
-      router.push("/auth?mode=signup");
+      // Bring them back to this exact comparison afterwards, rather than
+      // dropping them on a dashboard and making them rebuild it.
+      router.push(`/auth?mode=signup&redirect_url=${encodeURIComponent(router.asPath)}`);
       return;
     }
     setAlertTarget(provider);
@@ -409,7 +411,11 @@ export default function Results() {
               <p style={{ color: "rgba(255,255,255,0.6)", fontSize: "0.85rem", marginBottom: "1rem" }}>
                 Create a free account to save comparisons and set WhatsApp alerts.
               </p>
-              <Link href="/auth?mode=signup" className="btn-secondary" style={{ width: "100%", justifyContent: "center" }}>
+              <Link
+                href={`/auth?mode=signup&redirect_url=${encodeURIComponent(router.asPath)}`}
+                className="btn-secondary"
+                style={{ width: "100%", justifyContent: "center" }}
+              >
                 Create free account →
               </Link>
             </div>

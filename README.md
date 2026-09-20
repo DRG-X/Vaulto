@@ -543,10 +543,13 @@ outage should never end the comparison.
 cd backend && python -m pytest tests/ -q
 ```
 
-358 tests covering Decimal precision and rounding, ISO-4217 minor units,
+374 tests covering Decimal precision and rounding, ISO-4217 minor units,
 delivery parsing, fee-model re-basing, the five sort modes, the filters, a
-full three-provider comparison, and token verification — including the tokens
-that only look valid, such as another project's or the anon key itself.
+full three-provider comparison, token verification — including the tokens that
+only look valid, such as another project's or the anon key itself — and the
+sign-in/onboarding endpoints (`tests/test_user_onboarding.py`: sync idempotency
+and its insert race, corridors whose legs match, phone normalisation, partial
+settings updates).
 
 The provider tests run against **recorded payload shapes** in
 `tests/fixtures.py`, driven through real HTTP plumbing with a mock transport.
@@ -719,12 +722,58 @@ excluded are listed separately. Only genuine failures are surfaced as errors.
 Collapsing those into one "couldn't fetch rates" list makes a healthy system
 look broken and buries the one provider that really did fail.
 
+### Sign-in and onboarding
+
+Every user meets these three screens before anything else, so their failure
+modes are the ones nobody can route around.
+
+**One door in, one router out.** `/auth` is the only sign-in screen, and every
+path through it — password, Google, a code, a password reset — ends at
+`/post-auth`, never at `/dashboard`. `/post-auth` is the only place that
+creates the user row and decides between `/onboarding` and the dashboard.
+Sending anyone straight to `/dashboard` skips both; that is how an OAuth
+sign-up used to land on a dashboard with no account behind it. `middleware.js`
+turns unauthenticated traffic away at `/auth` too, so a session that ends
+mid-flow lands on our own screen rather than a hosted portal on another
+domain.
+
+**Every step that sends a code has a box to type it into.** Sign-up verifies
+the emailed code, a password reset takes the code and the new password, sign-in
+offers a one-time code instead of a password, and an account that owes a second
+factor gets prompted for it — Supabase grades a password-only session `aal1`,
+and the gap up to `aal2` is exactly "signed in, but not all the way". Each of
+these was previously a message saying "check your email" with nowhere to go
+next. The recovery email carries a link as well as a code, so `/reset-password`
+handles the click and `/auth` handles the typing.
+
+**The corridor has two ends.** Onboarding asks where you send *from* and where
+you send *to*, because deriving both from one answer stored everyone as
+`INR → INR` — a corridor the engine cannot quote, behind every "compare now"
+link on the dashboard. The two legs are validated against each other on the
+client, in the onboarding schema, and again on a partial update from settings,
+so no path can write one.
+
+**Where you were going survives the detour.** A protected page redirects to
+`/auth?redirect_url=…`, the flow carries it through OAuth and onboarding, and
+you land back where you were aiming instead of on a generic dashboard. Only
+same-site paths are honoured, and the sign-in flow's own pages are excluded so
+the return trip cannot loop.
+
+**Nothing in the flow can hang.** The auth-critical API calls carry a timeout,
+`/post-auth` retries a cold backend and then offers a real error with a Retry
+button, and `/api/users/sync` is keyed off the verified token rather than the
+body — a client that syncs before the Supabase session has hydrated used to
+get a 403 on the user's very first screen. Two syncs racing each other into
+the unique index adopt the winner instead of 500ing.
+
 ### Where things live
 
 ```
 frontend/
 ├── lib/
-│   ├── api.js            # Filter params; SORT_MODES
+│   ├── api.js            # Filter params; SORT_MODES; timeouts on auth calls
+│   ├── countries.js      # Country -> currency, dial code, universities
+│   ├── redirect.js       # Same-site-only return paths, loop-proof
 │   ├── format.js         # Money at real currency precision, ETA, rails, cost split
 │   └── providerMeta.js   # Outbound links, icons, category colours for all 28
 ├── components/
@@ -733,7 +782,13 @@ frontend/
 │   ├── SortBar.js        # Five modes, each naming its winner up front
 │   ├── FilterPanel.js    # Speed, payout rail, funding rail, promos
 │   └── ProviderStatus.js # Unavailable / filtered / failed, kept distinct
-└── pages/results.js      # Server-side sort + filters in the URL
+├── pages/
+│   ├── auth.js           # The only sign-in screen: password, Google, codes, reset
+│   ├── sso-callback.js   # Google returns here, then hands off to post-auth
+│   ├── reset-password.js # Where the recovery LINK lands (the code path is in auth.js)
+│   ├── post-auth.js      # Syncs the user row, routes to onboarding or dashboard
+│   ├── onboarding.js     # Corridor, university, alerts — resumable, skippable
+│   └── results.js        # Server-side sort + filters in the URL
 ```
 
 A null field renders as "—", never as zero. `fx_markup_pct: null` means no

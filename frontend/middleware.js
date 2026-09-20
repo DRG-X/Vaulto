@@ -57,7 +57,7 @@ export async function middleware(request) {
     // Come back here after signing in, instead of dumping everyone on the
     // dashboard and making them navigate again.
     signIn.searchParams.set(
-      "redirect_to",
+      "redirect_url",
       request.nextUrl.pathname + request.nextUrl.search
     );
     return NextResponse.redirect(signIn);

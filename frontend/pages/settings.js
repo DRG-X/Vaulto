@@ -6,6 +6,7 @@ import Link from "next/link";
 import Nav from "../components/Nav";
 import { getMe, updateMe } from "../lib/api";
 import { CURRENCIES } from "../lib/currencies";
+import { signInPath } from "../lib/redirect";
 
 const SECTIONS = [
   { key: "profile", icon: "👤", label: "Profile" },
@@ -36,7 +37,7 @@ export default function Settings() {
 
   useEffect(() => {
     if (!isLoaded) return;
-    if (!isSignedIn) { router.replace("/auth"); return; }
+    if (!isSignedIn) { router.replace(signInPath(router.asPath)); return; }
     loadProfile();
   }, [isLoaded, isSignedIn]);
 
@@ -52,6 +53,10 @@ export default function Settings() {
       setCorrTo(me.corridor_to || "INR");
       setHomeCurrency(me.home_currency || "GBP");
     } catch (e) {
+      if (e?.status === 401) { router.replace(signInPath(router.asPath)); return; }
+      // No row yet means onboarding never finished — finish it, rather than
+      // showing an empty settings page over a profile that doesn't exist.
+      if (e?.status === 404) { router.replace("/onboarding?redirect_url=%2Fsettings"); return; }
       setError(e.message || "Failed to load profile.");
     } finally {
       setLoading(false);
@@ -195,7 +200,12 @@ export default function Settings() {
                       {CURRENCIES.map(c => <option key={c.code} value={c.code}>{c.flag} {c.code} — {c.name}</option>)}
                     </select>
                   </div>
-                  <button className="btn-secondary" style={{ marginTop: "0.5rem" }} onClick={() => handleSave({ corridor_from: corrFrom, corridor_to: corrTo, home_currency: homeCurrency })} disabled={saving} id="save-corridors">
+                  {corrFrom === corrTo && (
+                    <p className="text-xs" style={{ color: "var(--error)", marginTop: "0.5rem" }}>
+                      Send and receive currencies must be different — there&rsquo;s nothing to compare otherwise.
+                    </p>
+                  )}
+                  <button className="btn-secondary" style={{ marginTop: "0.5rem" }} onClick={() => handleSave({ corridor_from: corrFrom, corridor_to: corrTo, home_currency: homeCurrency })} disabled={saving || corrFrom === corrTo} id="save-corridors">
                     {saving ? "Saving…" : "Save corridor"}
                   </button>
                 </div>
