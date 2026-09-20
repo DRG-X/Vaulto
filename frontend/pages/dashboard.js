@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/router";
-import { useAuth, useUser, useClerk } from "@clerk/nextjs";
+import { useAuth, useUser } from "../contexts/AuthContext";
 import Head from "next/head";
 import Link from "next/link";
 import CompareWidget from "../components/CompareWidget";
@@ -62,9 +62,8 @@ function getGreeting() {
 
 export default function Dashboard() {
   const router = useRouter();
-  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const { isLoaded, isSignedIn, getToken, signOut } = useAuth();
   const { user } = useUser();
-  const { signOut } = useClerk();
 
   const [profile,        setProfile]        = useState(null);
   const [comparisons,    setComparisons]    = useState([]);
@@ -77,7 +76,7 @@ export default function Dashboard() {
   useEffect(() => {
     if (!isLoaded) return;
     if (!isSignedIn) { router.replace(signInPath(router.asPath)); return; }
-    // Wait for the Clerk user object. Syncing with a blank id used to be
+    // Wait for the Supabase user object. Syncing with a blank id used to be
     // refused, which left the dashboard without the row it then 404s on.
     if (!user?.id) return;
 
@@ -85,9 +84,9 @@ export default function Dashboard() {
       try {
         const syncToken = await getToken();
         await syncUser(syncToken, {
-          clerk_id:  user.id,
-          email:     user.primaryEmailAddress?.emailAddress || "",
-          full_name: user.fullName || user.username || "",
+          supabase_id: user.id,
+          email:       user.email || "",
+          full_name:   user.fullName || "",
         });
       } catch (_) {}
 
@@ -134,9 +133,7 @@ export default function Dashboard() {
 
   const handleSignOut = async () => { await signOut(); router.push("/"); };
 
-  const initials = user?.firstName
-    ? `${user.firstName[0]}${user.lastName?.[0] || ""}`.toUpperCase()
-    : "?";
+  const initials = user?.initials || "?";
 
   const firstName        = user?.firstName || "there";
   const corridor         = profile?.corridor_from && profile?.corridor_to

@@ -4,8 +4,8 @@ import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.orm import Session
 
-import clerk
 import notifications
+import supabase_client
 from database import SessionLocal
 from models import RateAlert, User
 from engine.comparator import QuotePools, fetch_pools
@@ -152,17 +152,18 @@ async def _fire(alert: RateAlert, rate: float, provider: str, db) -> bool:
 
 async def _address_for(alert: RateAlert, user: User, db) -> str:
     """
-    The address to mail, looking it up in Clerk if we never captured one.
+    The address to mail, asking Supabase for it if we never captured one.
 
-    See clerk.py: the session token has no email claim by default, so
-    `user.email` is NULL for accounts created through the normal sign-up path.
-    The address is not missing — it was never copied across. Persisting what
-    we find means the lookup happens once per user, not once per alert.
+    A Supabase access token carries the address, so `/api/users/sync` stores it
+    on first sign-in and this fallback is rarely needed. It still is for rows
+    that predate that — every account carried over from Clerk, whose session
+    token had no email claim and left `users.email` NULL. Persisting what the
+    lookup finds means it happens once per user, not once per alert.
     """
     if user.email:
         return user.email
 
-    address = await clerk.fetch_primary_email(alert.clerk_user_id)
+    address = await supabase_client.fetch_primary_email(alert.supabase_user_id)
     if not address:
         return ""
 
@@ -171,7 +172,7 @@ async def _address_for(alert: RateAlert, user: User, db) -> str:
         db.commit()
     except Exception:
         db.rollback()
-        logger.warning("Could not persist the email address for %s", alert.clerk_user_id)
+        logger.warning("Could not persist the email address for %s", alert.supabase_user_id)
     return address
 
 
@@ -184,9 +185,12 @@ async def send_alert_notification(
     Returns True only when a notification actually went out. The caller uses
     that to decide whether the alert has been spent.
     """
-    user = db.query(User).filter(User.clerk_user_id == alert.clerk_user_id).first()
+    user = db.query(User).filter(User.supabase_user_id == alert.supabase_user_id).first()
     if not user:
-        logger.warning("Alert %s: no user found for clerk_user_id=%s", alert.id, alert.clerk_user_id)
+        logger.warning(
+            "Alert %s: no user found for supabase_user_id=%s",
+            alert.id, alert.supabase_user_id,
+        )
         return False
 
     # Describe what was ACTUALLY watched. A provider- or rail-scoped alert is
@@ -234,8 +238,8 @@ async def send_alert_notification(
     if not address:
         logger.error(
             "Alert %s triggered but no email address is on file for %s, and "
-            "Clerk did not supply one — nothing sent",
-            alert.id, alert.clerk_user_id,
+            "Supabase did not supply one — nothing sent",
+            alert.id, alert.supabase_user_id,
         )
         return False
 

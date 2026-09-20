@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/router";
-import { useSignIn, useSignUp, useAuth } from "@clerk/nextjs";
+import { useAuth, useSupabase } from "../contexts/AuthContext";
 import Head from "next/head";
 import Link from "next/link";
 import { redirectFromQuery, withRedirect } from "../lib/redirect";
@@ -15,7 +15,7 @@ const STEP_FORM    = "form";        // email + password
 const STEP_VERIFY  = "verify";      // sign-up: confirm the emailed code
 const STEP_RESET   = "reset";       // forgot: emailed code + new password
 const STEP_FACTOR  = "factor";      // sign-in: emailed code (passwordless)
-const STEP_2FA     = "2fa";         // sign-in: TOTP / SMS / backup code
+const STEP_2FA     = "2fa";         // sign-in: the enrolled MFA factor
 
 const RESEND_SECONDS = 30;
 
@@ -30,51 +30,65 @@ function getPasswordStrength(pw) {
 }
 
 /**
- * Turn a Clerk error into something a person can act on.
+ * Turn a Supabase auth error into something a person can act on.
  *
- * Clerk's raw messages are accurate and unhelpful ("Identifier is invalid"),
- * and the default here used to be a flat "Login failed." that told the user
- * nothing about what to do next.
+ * GoTrue's raw messages are accurate and unhelpful ("Invalid login
+ * credentials"), and the default here used to be a flat "Login failed." that
+ * told the user nothing about what to do next. `error.code` is the stable
+ * handle — the message text is not, so it is only ever the last resort.
  */
-function readClerkError(e, fallback) {
-  const first = e?.errors?.[0];
-  const code = first?.code;
+function readAuthError(e, fallback) {
+  const code = e?.code || e?.error_code;
   switch (code) {
-    case "form_identifier_not_found":
+    case "invalid_credentials":
+      return "That email and password don't match an account. Try again, or reset your password.";
+    case "user_not_found":
       return "We couldn't find an account with that email. Try signing up instead.";
-    case "form_password_incorrect":
-    case "form_password_validation_failed":
-      return "That password doesn't match this account. Try again, or reset it.";
-    case "form_identifier_exists":
+    case "email_not_confirmed":
+      return "Your email isn't confirmed yet. Enter the code we just sent to finish.";
+    case "user_already_exists":
+    case "email_exists":
       return "An account with this email already exists — log in instead.";
-    case "form_password_pwned":
-      return "That password has appeared in a data breach. Please pick a different one.";
-    case "form_password_length_too_short":
-      return "Passwords need to be at least 8 characters.";
-    case "form_param_format_invalid":
-      return "That email doesn't look right. Check it and try again.";
-    case "form_code_incorrect":
-    case "verification_failed":
-    case "form_param_nil":
-      return "That code isn't right. Check the digits, or send a new one.";
-    case "verification_expired":
+    case "weak_password":
+      return "That password is too easy to guess. Mix in another word, number or symbol.";
+    case "same_password":
+      return "That's the password you already have. Pick a different one.";
+    case "otp_expired":
       return "That code has expired. Send a new one and try again.";
+    case "otp_disabled":
+      return "Email codes are turned off for this project. Use your password instead.";
+    case "over_email_send_rate_limit":
+      return "We've sent a few emails already. Wait a minute, then ask for another.";
+    case "over_request_rate_limit":
     case "too_many_requests":
-    case "rate_limit_exceeded":
       return "Too many attempts. Wait a minute, then try again.";
-    case "captcha_invalid":
-    case "captcha_unavailable":
+    case "signup_disabled":
+      return "New accounts are closed at the moment. Please try again later.";
+    case "provider_disabled":
+    case "oauth_provider_not_supported":
+      return "That sign-in method isn't enabled. Use your email and password instead.";
+    case "validation_failed":
+      return "That email doesn't look right. Check it and try again.";
+    case "captcha_failed":
       return "We couldn't complete the security check. Reload the page and try again.";
+    case "mfa_verification_failed":
+      return "That code isn't right. Check the digits, or wait for the next one.";
+    case "mfa_challenge_expired":
+      return "That two-step prompt expired. Sign in again to get a new one.";
     default:
-      return first?.longMessage || first?.message || fallback;
+      break;
   }
+  // A 422 from GoTrue on a sign-up is almost always the password rule.
+  if (e?.status === 422 && /password/i.test(e?.message || "")) {
+    return "Passwords need to be at least 8 characters.";
+  }
+  return e?.message || fallback;
 }
 
 export default function Auth() {
   const router = useRouter();
+  const supabase = useSupabase();
   const { isLoaded: authLoaded, isSignedIn } = useAuth();
-  const { isLoaded: signInLoaded, signIn, setActive: setSignInActive } = useSignIn();
-  const { isLoaded: signUpLoaded, signUp, setActive: setSignUpActive } = useSignUp();
 
   const [mode, setMode] = useState(MODE_LOGIN);
   const [step, setStep] = useState(STEP_FORM);
@@ -84,7 +98,7 @@ export default function Auth() {
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
   const [newPassword, setNewPassword] = useState("");
-  const [secondFactor, setSecondFactor] = useState(null);   // { strategy, label }
+  const [secondFactor, setSecondFactor] = useState(null);   // { factorId, challengeId, label, isPhone }
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState("");
@@ -97,6 +111,13 @@ export default function Auth() {
   // account row behind it, skipping onboarding entirely.
   const leaving = useRef(false);
 
+  // Set for as long as THIS page is driving a flow. A password sign-in against
+  // an account with two-step verification creates a real (aal1) session before
+  // the second factor is asked for, so the effect below would see
+  // `isSignedIn` and redirect straight past the prompt. While we are driving,
+  // only the handlers decide when to leave.
+  const driving = useRef(false);
+
   const destination = redirectFromQuery(router.query, "/dashboard");
   const postAuthUrl = withRedirect("/post-auth", destination);
 
@@ -108,7 +129,7 @@ export default function Auth() {
   // Already signed in (came back to /auth with a live session)? There is
   // nothing to do here — post-auth decides between onboarding and dashboard.
   useEffect(() => {
-    if (authLoaded && isSignedIn && !leaving.current) {
+    if (authLoaded && isSignedIn && !leaving.current && !driving.current) {
       leaving.current = true;
       router.replace(postAuthUrl);
     }
@@ -121,11 +142,15 @@ export default function Auth() {
     return () => clearTimeout(t);
   }, [resendIn]);
 
-  const finish = useCallback(async (setActive, sessionId) => {
+  const finish = useCallback(() => {
     leaving.current = true;
-    await setActive({ session: sessionId });
     router.replace(postAuthUrl);
   }, [router, postAuthUrl]);
+
+  const emailRedirectTo = () =>
+    typeof window === "undefined"
+      ? undefined
+      : new URL(withRedirect("/sso-callback", destination), window.location.origin).toString();
 
   const switchMode = (next) => {
     setMode(next);
@@ -135,6 +160,7 @@ export default function Auth() {
     setCode("");
     setNewPassword("");
     setSecondFactor(null);
+    driving.current = false;
   };
 
   const passwordStrength = getPasswordStrength(mode === MODE_FORGOT ? newPassword : password);
@@ -142,99 +168,137 @@ export default function Auth() {
   const strengthColors = ["", "#ef4444", "#f59e0b", "#3b82f6", "#10b981"];
   const busy = loading || googleLoading;
 
+  /**
+   * Ask for the enrolled second factor, if this session still owes one.
+   *
+   * Supabase grades a session's assurance level: a password gets you `aal1`,
+   * and an account with a verified factor needs `aal2`. The gap between them is
+   * exactly "signed in, but not all the way", and it is what this step closes.
+   * Returns true when a prompt is now on screen.
+   */
+  const beginSecondFactor = async () => {
+    const { data: aal, error: aalError } = await supabase.auth.mfa.getAuthenticatorAssuranceLevel();
+    if (aalError) throw aalError;
+    if (!aal || aal.nextLevel !== "aal2" || aal.nextLevel === aal.currentLevel) return false;
+
+    const { data: factorData, error: listError } = await supabase.auth.mfa.listFactors();
+    if (listError) throw listError;
+    const factors = factorData?.all || factorData?.totp || [];
+    const factor = factors.find(f => f.status === "verified") || factors[0];
+    // An account that owes aal2 with nothing to challenge cannot be rescued
+    // from this screen; letting it through beats stranding it here.
+    if (!factor) return false;
+
+    const { data: challenge, error: challengeError } =
+      await supabase.auth.mfa.challenge({ factorId: factor.id });
+    if (challengeError) throw challengeError;
+
+    const isPhone = factor.factor_type === "phone";
+    setSecondFactor({
+      factorId: factor.id,
+      challengeId: challenge.id,
+      isPhone,
+      label: isPhone
+        ? "We texted a code to your phone."
+        : "Enter the code from your authenticator app.",
+    });
+    setStep(STEP_2FA);
+    setNotice("");
+    return true;
+  };
+
+  /** A session exists — go on to the second factor, or leave. */
+  const completeSession = async () => {
+    if (await beginSecondFactor()) return;
+    finish();
+  };
+
   // ── Google ────────────────────────────────────────────────────────────────
   const handleGoogleAuth = async () => {
     setError("");
-    // The button used to be live before Clerk had loaded, and clicking it
-    // threw on `undefined.authenticateWithRedirect`.
-    if (!signInLoaded || !signUpLoaded) return;
     setGoogleLoading(true);
+    driving.current = true;
     try {
-      const method = mode === MODE_SIGNUP ? signUp : signIn;
-      await method.authenticateWithRedirect({
-        strategy: "oauth_google",
-        redirectUrl: "/sso-callback",
-        redirectUrlComplete: postAuthUrl,
+      // The browser client uses PKCE, so Google sends the user back with a
+      // `code` that only this browser can exchange. /sso-callback does the
+      // exchange and then hands off to /post-auth.
+      const { error: oauthError } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: emailRedirectTo() },
       });
+      if (oauthError) throw oauthError;
+      // On success the browser is navigating away; nothing to do here.
     } catch (e) {
+      driving.current = false;
       setGoogleLoading(false);
-      setError(readClerkError(e, "Google sign-in failed. Please try again."));
+      setError(readAuthError(e, "Google sign-in failed. Please try again."));
     }
   };
 
   // ── Sign-in ───────────────────────────────────────────────────────────────
-  const routeSignInResult = async (result) => {
-    if (result.status === "complete") {
-      await finish(setSignInActive, result.createdSessionId);
-      return;
-    }
-
-    if (result.status === "needs_first_factor") {
-      const factors = result.supportedFirstFactors || [];
-      const emailCode = factors.find(f => f.strategy === "email_code");
-      if (emailCode) {
-        await signIn.prepareFirstFactor({
-          strategy: "email_code",
-          emailAddressId: emailCode.emailAddressId,
-        });
-        setStep(STEP_FACTOR);
-        setNotice(`We sent a 6-digit code to ${email}.`);
-        setResendIn(RESEND_SECONDS);
-        return;
-      }
-      if (factors.some(f => f.strategy === "oauth_google")) {
-        setError("This account was created with Google — use “Continue with Google” above.");
-        return;
-      }
-      setError("This account needs another way to sign in. Try resetting your password.");
-      return;
-    }
-
-    if (result.status === "needs_second_factor") {
-      const factors = result.supportedSecondFactors || [];
-      const totp  = factors.find(f => f.strategy === "totp");
-      const phone = factors.find(f => f.strategy === "phone_code");
-      if (totp) {
-        setSecondFactor({ strategy: "totp", label: "Enter the code from your authenticator app." });
-      } else if (phone) {
-        await signIn.prepareSecondFactor({ strategy: "phone_code", phoneNumberId: phone.phoneNumberId });
-        setSecondFactor({ strategy: "phone_code", label: "We texted a code to your phone." });
-      } else {
-        setSecondFactor({ strategy: "backup_code", label: "Enter one of your backup codes." });
-      }
-      setStep(STEP_2FA);
-      return;
-    }
-
-    if (result.status === "needs_new_password") {
-      // Hand them to the reset flow at its FIRST step: no code has been sent
-      // yet, so dropping them straight on the "enter your code" screen would
-      // strand them with nothing to type.
-      setMode(MODE_FORGOT);
-      setStep(STEP_FORM);
-      setNotice("This account needs a new password. Send yourself a reset code to continue.");
-      return;
-    }
-
-    setError("We couldn't finish signing you in. Please try again.");
-  };
-
   const handleLogin = async (e) => {
     e.preventDefault();
-    if (!signInLoaded || loading) return;
+    if (loading) return;
+    setError("");
+    setNotice("");
+    setLoading(true);
+    driving.current = true;
+    try {
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email: email.trim(),
+        password,
+      });
+      if (signInError) throw signInError;
+      await completeSession();
+    } catch (err) {
+      driving.current = false;
+      // The account exists but its email was never confirmed. Send the code
+      // and show the box for it, rather than reporting a dead end.
+      if (err?.code === "email_not_confirmed") {
+        try {
+          await supabase.auth.resend({
+            type: "signup",
+            email: email.trim(),
+            options: { emailRedirectTo: emailRedirectTo() },
+          });
+          setStep(STEP_VERIFY);
+          setMode(MODE_SIGNUP);
+          setNotice(`Your email isn't confirmed yet — we sent a new code to ${email.trim()}.`);
+          setResendIn(RESEND_SECONDS);
+          return;
+        } catch (resendErr) {
+          setError(readAuthError(resendErr, "Your email isn't confirmed yet."));
+          return;
+        }
+      }
+      setError(readAuthError(err, "We couldn't sign you in. Please try again."));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** Passwordless: email a one-time code instead of asking for the password. */
+  const handleEmailCode = async () => {
+    if (loading || !email.trim()) {
+      setError("Enter your email first, and we'll send you a code.");
+      return;
+    }
     setError("");
     setNotice("");
     setLoading(true);
     try {
-      const result = await signIn.create({ identifier: email.trim(), password });
-      await routeSignInResult(result);
+      const { error: otpError } = await supabase.auth.signInWithOtp({
+        email: email.trim(),
+        // This is the sign-IN path: an unknown address should be told so, not
+        // quietly turned into a half-finished account.
+        options: { shouldCreateUser: false, emailRedirectTo: emailRedirectTo() },
+      });
+      if (otpError) throw otpError;
+      setStep(STEP_FACTOR);
+      setNotice(`We sent a 6-digit code to ${email.trim()}.`);
+      setResendIn(RESEND_SECONDS);
     } catch (err) {
-      if (err?.errors?.[0]?.code === "session_exists") {
-        leaving.current = true;
-        router.replace(postAuthUrl);
-        return;
-      }
-      setError(readClerkError(err, "We couldn't sign you in. Please try again."));
+      setError(readAuthError(err, "We couldn't send a code. Please try again."));
     } finally {
       setLoading(false);
     }
@@ -242,14 +306,21 @@ export default function Auth() {
 
   const handleFirstFactorCode = async (e) => {
     e.preventDefault();
-    if (!signInLoaded || loading) return;
+    if (loading) return;
     setError("");
     setLoading(true);
+    driving.current = true;
     try {
-      const result = await signIn.attemptFirstFactor({ strategy: "email_code", code: code.trim() });
-      await routeSignInResult(result);
+      const { error: verifyError } = await supabase.auth.verifyOtp({
+        email: email.trim(),
+        token: code.trim(),
+        type: "email",
+      });
+      if (verifyError) throw verifyError;
+      await completeSession();
     } catch (err) {
-      setError(readClerkError(err, "That code isn't right. Please try again."));
+      driving.current = false;
+      setError(readAuthError(err, "That code isn't right. Please try again."));
     } finally {
       setLoading(false);
     }
@@ -257,17 +328,19 @@ export default function Auth() {
 
   const handleSecondFactor = async (e) => {
     e.preventDefault();
-    if (!signInLoaded || loading || !secondFactor) return;
+    if (loading || !secondFactor) return;
     setError("");
     setLoading(true);
     try {
-      const result = await signIn.attemptSecondFactor({
-        strategy: secondFactor.strategy,
+      const { error: verifyError } = await supabase.auth.mfa.verify({
+        factorId: secondFactor.factorId,
+        challengeId: secondFactor.challengeId,
         code: code.trim(),
       });
-      await routeSignInResult(result);
+      if (verifyError) throw verifyError;
+      finish();
     } catch (err) {
-      setError(readClerkError(err, "That code isn't right. Please try again."));
+      setError(readAuthError(err, "That code isn't right. Please try again."));
     } finally {
       setLoading(false);
     }
@@ -276,7 +349,7 @@ export default function Auth() {
   // ── Sign-up ───────────────────────────────────────────────────────────────
   const handleSignUp = async (e) => {
     e.preventDefault();
-    if (!signUpLoaded || loading) return;
+    if (loading) return;
     setError("");
     setNotice("");
 
@@ -286,40 +359,46 @@ export default function Auth() {
     }
 
     setLoading(true);
+    driving.current = true;
     try {
-      const parts = name.trim().split(/\s+/);
-      const firstName = parts[0] || "";
-      const lastName = parts.slice(1).join(" ") || "";
-      const result = await signUp.create({
-        emailAddress: email.trim(),
+      const { data, error: signUpError } = await supabase.auth.signUp({
+        email: email.trim(),
         password,
-        firstName,
-        lastName,
+        options: {
+          // Stored on the user and read back through useUser().fullName.
+          data: { full_name: name.trim() },
+          emailRedirectTo: emailRedirectTo(),
+        },
       });
+      if (signUpError) throw signUpError;
 
-      if (result.status === "complete") {
-        await finish(setSignUpActive, result.createdSessionId);
+      // Supabase will not admit that an address is already taken — it returns
+      // a user with no identities instead, to stop the form being used to
+      // enumerate accounts. That shape is the only signal we get.
+      if (data?.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
+        driving.current = false;
+        setMode(MODE_LOGIN);
+        setStep(STEP_FORM);
+        setError("You already have an account with this email — sign in below.");
         return;
       }
 
-      // The normal path for a Clerk instance that verifies email: send the
-      // code and show the box to type it into. This is the step that was
-      // missing — sign-up simply stopped here with "check your email".
-      await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
+      // Email confirmation off: the session is live and we are done.
+      if (data?.session) {
+        await completeSession();
+        return;
+      }
+
+      // The normal path for a project that confirms email: show the box to
+      // type the code into. This is the step that was missing — sign-up
+      // simply stopped here with "check your email".
+      driving.current = false;
       setStep(STEP_VERIFY);
       setNotice(`We sent a 6-digit code to ${email.trim()}.`);
       setResendIn(RESEND_SECONDS);
     } catch (err) {
-      if (err?.errors?.[0]?.code === "form_identifier_exists") {
-        setMode(MODE_LOGIN);
-        setStep(STEP_FORM);
-        setError("You already have an account with this email — sign in below.");
-      } else if (err?.errors?.[0]?.code === "session_exists") {
-        leaving.current = true;
-        router.replace(postAuthUrl);
-      } else {
-        setError(readClerkError(err, "We couldn't create your account. Please try again."));
-      }
+      driving.current = false;
+      setError(readAuthError(err, "We couldn't create your account. Please try again."));
     } finally {
       setLoading(false);
     }
@@ -327,23 +406,21 @@ export default function Auth() {
 
   const handleVerifyEmail = async (e) => {
     e.preventDefault();
-    if (!signUpLoaded || loading) return;
+    if (loading) return;
     setError("");
     setLoading(true);
+    driving.current = true;
     try {
-      const result = await signUp.attemptEmailAddressVerification({ code: code.trim() });
-      if (result.status === "complete") {
-        await finish(setSignUpActive, result.createdSessionId);
-        return;
-      }
-      const missing = (result.missingFields || []).join(", ");
-      setError(
-        missing
-          ? `Your account still needs: ${missing}. Please contact support.`
-          : "We couldn't verify that code. Please request a new one."
-      );
+      const { error: verifyError } = await supabase.auth.verifyOtp({
+        email: email.trim(),
+        token: code.trim(),
+        type: "signup",
+      });
+      if (verifyError) throw verifyError;
+      await completeSession();
     } catch (err) {
-      setError(readClerkError(err, "That code isn't right. Please try again."));
+      driving.current = false;
+      setError(readAuthError(err, "That code isn't right. Please try again."));
     } finally {
       setLoading(false);
     }
@@ -354,22 +431,29 @@ export default function Auth() {
     setError("");
     setLoading(true);
     try {
-      if (mode === MODE_SIGNUP) {
-        await signUp.prepareEmailAddressVerification({ strategy: "email_code" });
-      } else if (mode === MODE_FORGOT) {
-        await signIn.create({ strategy: "reset_password_email_code", identifier: email.trim() });
-      } else {
-        const factors = signIn?.supportedFirstFactors || [];
-        const emailCode = factors.find(f => f.strategy === "email_code");
-        await signIn.prepareFirstFactor({
-          strategy: "email_code",
-          emailAddressId: emailCode?.emailAddressId,
+      if (step === STEP_VERIFY) {
+        const { error: resendError } = await supabase.auth.resend({
+          type: "signup",
+          email: email.trim(),
+          options: { emailRedirectTo: emailRedirectTo() },
         });
+        if (resendError) throw resendError;
+      } else if (step === STEP_RESET) {
+        const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+          redirectTo: `${window.location.origin}/reset-password`,
+        });
+        if (resetError) throw resetError;
+      } else {
+        const { error: otpError } = await supabase.auth.signInWithOtp({
+          email: email.trim(),
+          options: { shouldCreateUser: false, emailRedirectTo: emailRedirectTo() },
+        });
+        if (otpError) throw otpError;
       }
       setNotice(`We sent a new code to ${email.trim()}.`);
       setResendIn(RESEND_SECONDS);
     } catch (err) {
-      setError(readClerkError(err, "We couldn't send another code just yet."));
+      setError(readAuthError(err, "We couldn't send another code just yet."));
     } finally {
       setLoading(false);
     }
@@ -378,17 +462,23 @@ export default function Auth() {
   // ── Forgot password ───────────────────────────────────────────────────────
   const handleForgot = async (e) => {
     e.preventDefault();
-    if (!signInLoaded || loading || !email.trim()) return;
+    if (loading || !email.trim()) return;
     setError("");
     setNotice("");
     setLoading(true);
     try {
-      await signIn.create({ strategy: "reset_password_email_code", identifier: email.trim() });
+      // The recovery email carries both a link and a code. The link lands on
+      // /reset-password; the code is typed in on the next step here, so
+      // whichever one the user reaches for works.
+      const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+        redirectTo: `${window.location.origin}/reset-password`,
+      });
+      if (resetError) throw resetError;
       setStep(STEP_RESET);
       setNotice(`We sent a 6-digit code to ${email.trim()}.`);
       setResendIn(RESEND_SECONDS);
     } catch (err) {
-      setError(readClerkError(err, "We couldn't send a reset code. Please try again."));
+      setError(readAuthError(err, "We couldn't send a reset code. Please try again."));
     } finally {
       setLoading(false);
     }
@@ -396,7 +486,7 @@ export default function Auth() {
 
   const handleReset = async (e) => {
     e.preventDefault();
-    if (!signInLoaded || loading) return;
+    if (loading) return;
     setError("");
 
     if (newPassword.length < 8) {
@@ -405,49 +495,51 @@ export default function Auth() {
     }
 
     setLoading(true);
+    driving.current = true;
     try {
-      const result = await signIn.attemptFirstFactor({
-        strategy: "reset_password_email_code",
-        code: code.trim(),
-        password: newPassword,
+      // The code buys a session; that session is what authorises the change.
+      const { error: verifyError } = await supabase.auth.verifyOtp({
+        email: email.trim(),
+        token: code.trim(),
+        type: "recovery",
       });
-      await routeSignInResult(result);
+      if (verifyError) throw verifyError;
+
+      const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+      if (updateError) throw updateError;
+
+      await completeSession();
     } catch (err) {
-      setError(readClerkError(err, "We couldn't reset your password. Please try again."));
+      driving.current = false;
+      setError(readAuthError(err, "We couldn't reset your password. Please try again."));
     } finally {
       setLoading(false);
     }
   };
 
   // ── Shared pieces ─────────────────────────────────────────────────────────
-  // Backup codes are alphanumeric and longer than six characters, so the
-  // digits-only box would silently eat the one thing a locked-out user has.
-  const isBackupCode = step === STEP_2FA && secondFactor?.strategy === "backup_code";
-
+  // A recovery or authenticator code is always six digits here, so the box is
+  // digits-only — pasting a formatted code still lands correctly.
   const codeField = (labelId) => (
     <div className="field">
-      <label htmlFor={labelId}>{isBackupCode ? "Backup code" : "6-digit code"}</label>
+      <label htmlFor={labelId}>6-digit code</label>
       <input
         id={labelId}
-        className={isBackupCode ? "" : "code-input"}
+        className="code-input"
         type="text"
-        inputMode={isBackupCode ? "text" : "numeric"}
+        inputMode="numeric"
         autoComplete="one-time-code"
-        maxLength={isBackupCode ? 24 : 6}
+        maxLength={6}
         value={code}
-        onChange={e => setCode(
-          isBackupCode
-            ? e.target.value.trim().slice(0, 24)
-            : e.target.value.replace(/\D/g, "").slice(0, 6)
-        )}
-        placeholder={isBackupCode ? "xxxxxxxx" : "123456"}
+        onChange={e => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+        placeholder="123456"
         required
         autoFocus
       />
     </div>
   );
 
-  const codeIncomplete = isBackupCode ? code.trim().length === 0 : code.length < 6;
+  const codeIncomplete = code.length < 6;
 
   const resendRow = (
     <div className="resend-row">
@@ -547,7 +639,7 @@ export default function Auth() {
                   <button
                     className="google-btn"
                     onClick={handleGoogleAuth}
-                    disabled={busy || !signInLoaded || !signUpLoaded}
+                    disabled={busy}
                     id="auth-google-btn"
                     type="button"
                   >
@@ -589,9 +681,14 @@ export default function Auth() {
                     </button>
                   </div>
                   {feedback}
-                  <button type="submit" className="btn-secondary auth-submit" disabled={busy || !signInLoaded} id="login-submit">
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy} id="login-submit">
                     {loading ? "Signing in…" : "Sign in →"}
                   </button>
+                  <p className="auth-swap">
+                    <button type="button" className="forgot-link" onClick={handleEmailCode} disabled={busy} id="login-email-code">
+                      Email me a code instead
+                    </button>
+                  </p>
                   <p className="auth-swap">
                     New to Vaulto?{" "}
                     <button type="button" className="forgot-link" onClick={() => switchMode(MODE_SIGNUP)}>
@@ -637,11 +734,7 @@ export default function Auth() {
                     )}
                   </div>
                   {feedback}
-                  {/* Clerk drops its bot-protection widget in here when the
-                      instance has it turned on. Without the target element
-                      sign-up fails with captcha_unavailable. */}
-                  <div id="clerk-captcha" className="clerk-captcha" />
-                  <button type="submit" className="btn-secondary auth-submit" disabled={busy || !signUpLoaded} id="signup-submit">
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy} id="signup-submit">
                     {loading ? "Creating account…" : "Create account →"}
                   </button>
                   <p className="auth-swap">
@@ -657,7 +750,8 @@ export default function Auth() {
               {mode === MODE_SIGNUP && step === STEP_VERIFY && (
                 <form onSubmit={handleVerifyEmail}>
                   <p className="auth-step-copy">
-                    Enter the code we emailed you to finish creating your account.
+                    Enter the code we emailed you to finish creating your account —
+                    or just click the link in that email.
                   </p>
                   {codeField("verify-code")}
                   {feedback}
@@ -671,7 +765,7 @@ export default function Auth() {
                 </form>
               )}
 
-              {/* ── Login: emailed code (passwordless / extra factor) ── */}
+              {/* ── Login: emailed code (passwordless) ── */}
               {mode === MODE_LOGIN && step === STEP_FACTOR && (
                 <form onSubmit={handleFirstFactorCode}>
                   <p className="auth-step-copy">Enter the code we emailed you to continue.</p>
@@ -714,7 +808,7 @@ export default function Auth() {
                            onChange={e => setEmail(e.target.value)} placeholder="you@example.com" required />
                   </div>
                   {feedback}
-                  <button type="submit" className="btn-secondary auth-submit" disabled={busy || !signInLoaded} id="forgot-submit">
+                  <button type="submit" className="btn-secondary auth-submit" disabled={busy} id="forgot-submit">
                     {loading ? "Sending…" : "Send reset code →"}
                   </button>
                   <button type="button" className="btn-ghost auth-back" onClick={() => switchMode(MODE_LOGIN)}>
@@ -936,8 +1030,6 @@ export default function Auth() {
           font-size: 0.8rem;
           margin-top: 1rem;
         }
-
-        .clerk-captcha:empty { display: none; }
 
         .auth-footer-links {
           display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;

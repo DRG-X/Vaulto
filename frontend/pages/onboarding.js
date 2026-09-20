@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import Head from "next/head";
 import { useRouter } from "next/router";
 import Link from "next/link";
-import { useAuth } from "@clerk/nextjs";
+import { useAuth } from "../contexts/AuthContext";
 import { COUNTRIES_FULL, currencyForCountry, dialCodeForCountry, universitiesForCountry } from "../lib/countries";
 import { CURRENCIES } from "../lib/currencies";
 import { completeOnboarding, getMe } from "../lib/api";
@@ -235,7 +235,7 @@ export default function Onboarding() {
     }
   };
 
-  // While Clerk loads or we're reading an existing profile, show the same
+  // While the session loads or we're reading an existing profile, show the same
   // loading state as post-auth rather than a form that can't submit yet.
   if (!isLoaded || bootstrapping) {
     return (

@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/router";
-import { useAuth, useUser, useClerk } from "@clerk/nextjs";
+import { useAuth, useUser } from "../../contexts/AuthContext";
 import Head from "next/head";
 import Link from "next/link";
 import { listComparisons } from "../../lib/api";
@@ -32,9 +32,8 @@ const MOCK_CORRIDORS = [
 
 export default function AdminAnalytics() {
   const router = useRouter();
-  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const { isLoaded, isSignedIn, getToken, signOut } = useAuth();
   const { user } = useUser();
-  const { signOut } = useClerk();
 
   const [comparisons, setComparisons] = useState([]);
   const [loading, setLoading] = useState(true);

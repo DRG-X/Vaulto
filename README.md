@@ -76,6 +76,11 @@ Flint is a real-time comparison tool that fetches live quotes from **Wise**, **R
 flint/
 ├── backend/
 │   ├── main.py                 # FastAPI app + CORS + routes
+│   ├── auth.py                 # Supabase JWT verification (JWKS + legacy HS256)
+│   ├── supabase_client.py      # Supabase Admin API — recovers a missing address
+│   ├── database.py             # Supabase Postgres engine + session
+│   ├── models.py               # SQLAlchemy tables, keyed on supabase_user_id
+│   ├── alembic/                # Schema migrations, incl. the RLS lockdown
 │   ├── scripts/
 │   │   └── verify_providers.py # Check every provider against its live endpoint
 │   ├── schemas.py              # Pydantic models (shared data contract)
@@ -104,14 +109,18 @@ flint/
 │   │   ├── ranking.py          # Sort modes + filters
 │   │   ├── sanity.py           # Reject rates that cannot be right
 │   │   └── comparator.py       # Select, fetch, normalize, filter, rank
-│   └── tests/                  # 309 tests
+│   └── tests/                  # 358 tests
 │
 └── frontend/
     ├── next.config.js
     ├── package.json
-    ├── .env.local.example
+    ├── .env.example
+    ├── middleware.js           # Supabase session refresh + protected routes
+    ├── contexts/
+    │   └── AuthContext.js      # useAuth() / useUser() over supabase-js
     ├── lib/
-    │   └── api.js              # fetch wrapper for /compare
+    │   ├── supabase.js         # Cookie-backed browser client (@supabase/ssr)
+    │   └── api.js              # fetch wrapper, sends the access token
     ├── styles/
     │   └── globals.css         # Full design system (dark terminal aesthetic)
     ├── components/
@@ -124,12 +133,133 @@ flint/
 
 ---
 
+## Supabase (database + auth)
+
+Both halves of the backend live in one Supabase project: Postgres holds the
+tables, and Supabase Auth issues the sessions. There is no separate auth
+vendor and no separate database host.
+
+### Create the project
+
+1. Create a project at [supabase.com](https://supabase.com) and note the
+   database password — it appears once.
+2. **Project Settings → API** gives you three values:
+   - `Project URL` → `SUPABASE_URL` (backend) and `NEXT_PUBLIC_SUPABASE_URL`
+   - `anon` / publishable key → `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+   - `service_role` key → `SUPABASE_SERVICE_ROLE_KEY` (**backend only**)
+3. **Project Settings → Database → Connection string → URI** gives the two
+   Postgres URLs. Use the **transaction pooler** (port 6543) for
+   `DATABASE_URL`, and the **session pooler** (port 5432) for `DIRECT_URL`.
+
+`service_role` bypasses Row Level Security completely. It belongs in the
+backend's environment and nowhere else — never in a `NEXT_PUBLIC_` variable,
+never in the browser bundle.
+
+### Which key goes where
+
+| Key | Where it lives | What it can do |
+|---|---|---|
+| `anon` / publishable | Browser bundle, by design | Sign in, sign up, refresh a session. Reaches no app table — RLS denies it |
+| `service_role` | Backend environment only | Everything, RLS included. Used solely to read an address out of `auth.users` when an alert fires |
+| Postgres connection string | Backend environment only | The API's own connection; it owns the tables, so RLS does not apply to it |
+
+### Create the schema
+
+Alembic owns the schema — not the Supabase dashboard, and not
+`supabase db push`. Point it at the project and run it:
+
+```bash
+cd backend
+export DATABASE_URL='postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres'
+export DIRECT_URL='postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres'
+alembic upgrade head
+```
+
+`DIRECT_URL` matters here: migrations run their DDL inside a single
+transaction, and the transaction pooler can hand consecutive statements to
+different backends. The API itself is stateless and is happy on the pooler.
+
+The app also runs `alembic upgrade head` on startup (`main.run_migrations`),
+so a deploy migrates itself. Running it by hand first is how you see the
+output.
+
+### Row Level Security
+
+Supabase publishes every table in `public` through PostgREST, reachable with
+the anon key that ships in the frontend bundle. A table with RLS **disabled**
+is therefore world-readable and world-writable.
+
+Migration `c3f8a1d47e60` enables RLS on `users`, `comparisons`, `rate_alerts`
+and `provider_clicks`, and revokes the `anon` and `authenticated` grants. With
+no policies attached, PostgREST can reach none of them. The API is unaffected:
+it connects as the table owner, and owners bypass RLS.
+
+Every read and write still goes through FastAPI, which authorises it against
+the `sub` of a verified token. If you later add a policy to let the browser
+query a table directly, scope it to `auth.uid()` — a policy added for one
+table does not re-open the others.
+
+### Auth configuration
+
+**Authentication → URL Configuration:**
+
+- *Site URL* — `http://localhost:3000` in development, your Vercel URL in
+  production.
+- *Redirect URLs* — add `http://localhost:3000/**` and
+  `https://your-app.vercel.app/**`. Supabase refuses to redirect anywhere not
+  on this list, and OAuth fails with a bare "redirect not allowed" until the
+  callback is there.
+
+**Authentication → Providers → Google:** enable it and paste the client ID and
+secret from the Google Cloud console. The authorised redirect URI Google needs
+is `https://your-project-ref.supabase.co/auth/v1/callback` — Supabase's own
+URL, not this app's.
+
+**Authentication → Providers → Email:** "Confirm email" is on by default. The
+sign-up form handles that: it tells the user to check their inbox rather than
+pretending they are signed in. Turn it off for faster local testing.
+
+### How a request is authenticated
+
+1. The browser signs in through `supabase-js`, which stores the session **in
+   cookies** (`@supabase/ssr`'s `createBrowserClient`) so `middleware.js` can
+   see it server-side.
+2. `contexts/AuthContext.js` exposes `useAuth()` / `useUser()`, and
+   `getToken()` returns a fresh access token, refreshing it when it is close
+   to expiry.
+3. `lib/api.js` sends it as `Authorization: Bearer <token>`.
+4. `backend/auth.py` verifies the signature, the issuer and the audience, then
+   hands the route `{user_id, email, full_name}`. `user_id` is the UUID from
+   `auth.users` and the only thing any query filters on.
+
+Signature verification follows the token's own `alg` header: HS256 against
+`SUPABASE_JWT_SECRET` (legacy projects), anything asymmetric against the
+project's JWKS. A project rotating from one to the other needs no redeploy.
+
+### Migrating from Clerk
+
+Existing rows keep their old Clerk ids in the renamed `supabase_user_id`
+column — nothing is deleted, but those ids match no Supabase user, so the
+history attached to them will not appear for the re-registered account. To
+carry it across, sign the user up in Supabase and re-point the rows:
+
+```sql
+UPDATE users SET supabase_user_id = '<new-uuid>' WHERE supabase_user_id = 'user_oldClerkId';
+```
+
+The foreign keys are `ON UPDATE NO ACTION`, so update the child tables
+(`comparisons`, `rate_alerts`, `provider_clicks`) in the same transaction.
+
+---
+
 ## Setup & Running Locally
 
 ### Prerequisites
 
 - Python 3.11+
 - Node.js 18+
+- A Supabase project (see the section above) — or nothing at all, if you are
+  happy with the SQLite fallback and no sign-in
 - (Optional) Chromium — only needed if provider APIs are blocked and Playwright fallbacks trigger
 
 ---
@@ -149,12 +279,19 @@ pip install -r requirements.txt
 # Install Playwright browsers (only needed for scraping fallback)
 playwright install chromium
 
-# Copy env file
+# Copy env file and fill in the Supabase values
 cp .env.example .env
+
+# Create the schema in Supabase (skip to use the SQLite fallback)
+alembic upgrade head
 
 # Start the server
 uvicorn main:app --reload --port 8000
 ```
+
+With `DATABASE_URL` unset the backend falls back to `sqlite:///./flint.db`,
+which is enough to work on the comparison engine. Anything behind a login
+needs the Supabase values.
 
 The API will be live at: **http://localhost:8000**
 
@@ -181,12 +318,15 @@ cd flint/frontend
 # Install dependencies
 npm install
 
-# Copy env file
-cp .env.local.example .env.local
+# Copy env file and fill in the Supabase values
+cp .env.example .env.local
 
 # Start the dev server
 npm run dev
 ```
+
+`NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` are required —
+without them every page that touches auth throws on load.
 
 The app will be live at: **http://localhost:3000**
 
@@ -403,11 +543,13 @@ outage should never end the comparison.
 cd backend && python -m pytest tests/ -q
 ```
 
-325 tests covering Decimal precision and rounding, ISO-4217 minor units,
+374 tests covering Decimal precision and rounding, ISO-4217 minor units,
 delivery parsing, fee-model re-basing, the five sort modes, the filters, a
-full three-provider comparison, and the sign-in/onboarding endpoints
-(`tests/test_user_onboarding.py`: sync idempotency and its insert race,
-corridors whose legs match, phone normalisation, partial settings updates).
+full three-provider comparison, token verification — including the tokens that
+only look valid, such as another project's or the anon key itself — and the
+sign-in/onboarding endpoints (`tests/test_user_onboarding.py`: sync idempotency
+and its insert race, corridors whose legs match, phone normalisation, partial
+settings updates).
 
 The provider tests run against **recorded payload shapes** in
 `tests/fixtures.py`, driven through real HTTP plumbing with a mock transport.
@@ -419,14 +561,31 @@ responses before trusting a deploy.
 
 ## Deployment
 
-### Backend (Railway / Render / Fly.io)
+### Database + auth (Supabase)
+
+Managed — nothing to deploy. Point the backend at the project and it migrates
+itself on startup. See [Supabase (database + auth)](#supabase-database--auth).
+
+### Backend (Render / Fly.io / Railway / anywhere that runs a container)
 
 ```bash
 # Procfile
 web: uvicorn main:app --host 0.0.0.0 --port $PORT
 ```
 
-Set env var: `ALLOWED_ORIGINS=https://your-frontend.vercel.app`
+Required environment:
+
+```
+DATABASE_URL=postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres
+DIRECT_URL=postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<service_role key>
+ALLOWED_ORIGINS=https://your-frontend.vercel.app
+ADMIN_USER_IDS=<comma-separated Supabase user UUIDs>
+```
+
+Add `SUPABASE_JWT_SECRET` only if the project still signs tokens with the
+legacy shared secret.
 
 ### Frontend (Vercel)
 
@@ -434,7 +593,17 @@ Set env var: `ALLOWED_ORIGINS=https://your-frontend.vercel.app`
 vercel deploy
 ```
 
-Set env var: `NEXT_PUBLIC_API_URL=https://your-backend.railway.app`
+Required environment:
+
+```
+NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon key>
+NEXT_PUBLIC_API_URL=https://your-backend.example.com
+NEXT_PUBLIC_ADMIN_USER_IDS=<comma-separated Supabase user UUIDs>
+```
+
+Then add the deployed origin to Supabase's **Authentication → URL
+Configuration → Redirect URLs**, or OAuth will refuse to come back to it.
 
 ---
 
@@ -563,15 +732,19 @@ path through it — password, Google, a code, a password reset — ends at
 `/post-auth`, never at `/dashboard`. `/post-auth` is the only place that
 creates the user row and decides between `/onboarding` and the dashboard.
 Sending anyone straight to `/dashboard` skips both; that is how an OAuth
-sign-up used to land on a dashboard with no account behind it. Clerk's own
-redirects (a protected page, an expired session) are pointed at `/auth` too,
-so a session that ends mid-flow does not drop the user onto a hosted portal on
-another domain.
+sign-up used to land on a dashboard with no account behind it. `middleware.js`
+turns unauthenticated traffic away at `/auth` too, so a session that ends
+mid-flow lands on our own screen rather than a hosted portal on another
+domain.
 
 **Every step that sends a code has a box to type it into.** Sign-up verifies
-the emailed code, a password reset takes the code and the new password, and
-sign-in handles a second factor (authenticator, SMS, or a backup code). Each
-was previously a message saying "check your email" with nowhere to go next.
+the emailed code, a password reset takes the code and the new password, sign-in
+offers a one-time code instead of a password, and an account that owes a second
+factor gets prompted for it — Supabase grades a password-only session `aal1`,
+and the gap up to `aal2` is exactly "signed in, but not all the way". Each of
+these was previously a message saying "check your email" with nowhere to go
+next. The recovery email carries a link as well as a code, so `/reset-password`
+handles the click and `/auth` handles the typing.
 
 **The corridor has two ends.** Onboarding asks where you send *from* and where
 you send *to*, because deriving both from one answer stored everyone as
@@ -589,7 +762,7 @@ the return trip cannot loop.
 **Nothing in the flow can hang.** The auth-critical API calls carry a timeout,
 `/post-auth` retries a cold backend and then offers a real error with a Retry
 button, and `/api/users/sync` is keyed off the verified token rather than the
-body — a client that syncs before Clerk has hydrated its user object used to
+body — a client that syncs before the Supabase session has hydrated used to
 get a 403 on the user's very first screen. Two syncs racing each other into
 the unique index adopt the winner instead of 500ing.
 
@@ -612,6 +785,7 @@ frontend/
 ├── pages/
 │   ├── auth.js           # The only sign-in screen: password, Google, codes, reset
 │   ├── sso-callback.js   # Google returns here, then hands off to post-auth
+│   ├── reset-password.js # Where the recovery LINK lands (the code path is in auth.js)
 │   ├── post-auth.js      # Syncs the user row, routes to onboarding or dashboard
 │   ├── onboarding.js     # Corridor, university, alerts — resumable, skippable
 │   └── results.js        # Server-side sort + filters in the URL

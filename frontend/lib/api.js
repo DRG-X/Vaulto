@@ -133,12 +133,12 @@ export async function compareProviders({
 
 // ── /api/users ─────────────────────────────────────────────────────────────────
 
-/** Upsert user row after Clerk sign-in/sign-up */
-export async function syncUser(token, { clerk_id, email, full_name }) {
+/** Upsert the user row after a Supabase sign-in/sign-up */
+export async function syncUser(token, { supabase_id, email, full_name }) {
   const res = await fetchWithTimeout(`${API_URL}/api/users/sync`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders(token) },
-    body: JSON.stringify({ clerk_id, email, full_name }),
+    body: JSON.stringify({ supabase_id, email, full_name }),
   });
   return handleResponse(res);
 }

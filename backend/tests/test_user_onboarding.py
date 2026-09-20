@@ -17,8 +17,13 @@ from sqlalchemy.pool import StaticPool
 
 import main
 import models
-from auth import verify_clerk_token
+from auth import verify_supabase_token
 from database import Base, get_db
+
+
+#: A Supabase auth.users id is a UUID, not Clerk's "user_xxx".
+USER_ID       = "3f0c9a7e-2b41-4d8e-9c1a-5f6b7c8d9e01"
+OTHER_USER_ID = "8a1d2c3b-4e5f-4061-8273-9a0b1c2d3e4f"
 
 
 @pytest.fixture()
@@ -39,9 +44,10 @@ def client():
             db.close()
 
     main.app.dependency_overrides[get_db] = override_db
-    main.app.dependency_overrides[verify_clerk_token] = lambda: {
-        "clerk_user_id": "user_abc",
+    main.app.dependency_overrides[verify_supabase_token] = lambda: {
+        "user_id": USER_ID,
         "email": "token@example.com",
+        "full_name": None,
     }
     c = TestClient(main.app)
     c.session_factory = TestingSession
@@ -52,30 +58,30 @@ def client():
 class TestSync:
     def test_first_sync_creates_an_un_onboarded_user(self, client):
         r = client.post("/api/users/sync", json={
-            "clerk_id": "user_abc", "email": "a@b.com", "full_name": "Ada L",
+            "supabase_id": USER_ID, "email": "a@b.com", "full_name": "Ada L",
         })
         assert r.status_code == 200
         body = r.json()
-        assert body["clerk_user_id"] == "user_abc"
+        assert body["supabase_user_id"] == USER_ID
         assert body["is_onboarded"] is False
         assert body["full_name"] == "Ada L"
 
     def test_sync_is_idempotent(self, client):
-        first = client.post("/api/users/sync", json={"clerk_id": "user_abc", "email": "a@b.com"})
-        second = client.post("/api/users/sync", json={"clerk_id": "user_abc", "email": "a@b.com"})
+        first = client.post("/api/users/sync", json={"supabase_id": USER_ID, "email": "a@b.com"})
+        second = client.post("/api/users/sync", json={"supabase_id": USER_ID, "email": "a@b.com"})
         assert first.json()["id"] == second.json()["id"]
 
-    def test_sync_without_a_clerk_id_uses_the_token(self, client):
+    def test_sync_without_a_supabase_id_uses_the_token(self, client):
         """
-        The regression: post-auth fires before Clerk hydrates `user`, sends
-        `clerk_id: ""`, and the user's first screen 403s.
+        The regression: post-auth fires before the Supabase session has
+        hydrated, sends `supabase_id: ""`, and the first screen 403s.
         """
-        r = client.post("/api/users/sync", json={"clerk_id": "", "email": ""})
+        r = client.post("/api/users/sync", json={"supabase_id": "", "email": ""})
         assert r.status_code == 200
-        assert r.json()["clerk_user_id"] == "user_abc"
+        assert r.json()["supabase_user_id"] == USER_ID
 
     def test_sync_still_refuses_someone_elses_account(self, client):
-        r = client.post("/api/users/sync", json={"clerk_id": "user_someone_else", "email": "x@y.com"})
+        r = client.post("/api/users/sync", json={"supabase_id": OTHER_USER_ID, "email": "x@y.com"})
         assert r.status_code == 403
 
     def test_a_losing_insert_race_adopts_the_winner(self, client):
@@ -84,18 +90,18 @@ class TestSync:
         raise IntegrityError and surface as a 500 on the very first screen.
         """
         other = client.session_factory()
-        other.add(models.User(clerk_user_id="user_abc", email="race@b.com", is_onboarded=False))
+        other.add(models.User(supabase_user_id=USER_ID, email="race@b.com", is_onboarded=False))
         other.commit()
-        row_id = other.query(models.User).filter_by(clerk_user_id="user_abc").one().id
+        row_id = other.query(models.User).filter_by(supabase_user_id=USER_ID).one().id
         other.close()
 
-        r = client.post("/api/users/sync", json={"clerk_id": "user_abc", "email": "a@b.com"})
+        r = client.post("/api/users/sync", json={"supabase_id": USER_ID, "email": "a@b.com"})
         assert r.status_code == 200
         assert r.json()["id"] == row_id
 
     def test_sync_refreshes_a_changed_name(self, client):
-        client.post("/api/users/sync", json={"clerk_id": "user_abc", "full_name": "Ada L"})
-        r = client.post("/api/users/sync", json={"clerk_id": "user_abc", "full_name": "Ada Lovelace"})
+        client.post("/api/users/sync", json={"supabase_id": USER_ID, "full_name": "Ada L"})
+        r = client.post("/api/users/sync", json={"supabase_id": USER_ID, "full_name": "Ada Lovelace"})
         assert r.json()["full_name"] == "Ada Lovelace"
 
 
@@ -105,7 +111,7 @@ class TestStatus:
         assert r.json() == {"exists": False, "is_onboarded": False}
 
     def test_status_flips_after_onboarding(self, client):
-        client.post("/api/users/sync", json={"clerk_id": "user_abc"})
+        client.post("/api/users/sync", json={"supabase_id": USER_ID})
         assert client.get("/user/status").json() == {"exists": True, "is_onboarded": False}
 
         client.post("/api/onboarding/complete", json={
@@ -117,7 +123,7 @@ class TestStatus:
 
 class TestOnboarding:
     def test_completing_onboarding_stores_the_corridor(self, client):
-        client.post("/api/users/sync", json={"clerk_id": "user_abc"})
+        client.post("/api/users/sync", json={"supabase_id": USER_ID})
         r = client.post("/api/onboarding/complete", json={
             "country": "gb", "university": " University College London ",
             "whatsapp_number": "+44 7700 900-123",

@@ -263,19 +263,19 @@ def normalize_phone(v: Optional[str]) -> Optional[str]:
 
 class UserSync(BaseModel):
     """
-    Called after Clerk sign-up/sign-in to upsert the user row.
+    Called after Supabase sign-up / sign-in to upsert the user row.
 
     Every field is optional on purpose. The row is keyed off the `sub` claim of
     the verified JWT, never off the body, so a client that calls sync one tick
-    before Clerk has hydrated its user object still syncs the right account
-    instead of being rejected. `clerk_id` is accepted when the caller knows it
-    and is then checked against the token — a mismatch is a real error.
+    before Supabase has hydrated its user object still syncs the right account
+    instead of being rejected. `supabase_id` is accepted when the caller knows
+    it and is then checked against the token — a mismatch is a real error.
     """
-    clerk_id: Optional[str] = None
+    supabase_id: Optional[str] = None
     email: Optional[str] = None
     full_name: Optional[str] = None
 
-    @field_validator("clerk_id", "email", "full_name")
+    @field_validator("supabase_id", "email", "full_name")
     @classmethod
     def _blank_to_none(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
@@ -286,7 +286,7 @@ class UserSync(BaseModel):
 
 class UserRead(BaseModel):
     id: int
-    clerk_user_id: str
+    supabase_user_id: str
     email: Optional[str] = None
     full_name: Optional[str] = None
     country: Optional[str] = None
@@ -402,7 +402,7 @@ class ProfileCreate(BaseModel):
 
 class ProfileResponse(BaseModel):
     id: int
-    clerk_user_id: str
+    supabase_user_id: str
     email: Optional[str] = None
     country: Optional[str] = None
     university: Optional[str] = None
@@ -415,7 +415,7 @@ class ProfileResponse(BaseModel):
 
 
 class UserStatusResponse(BaseModel):
-    """Lightweight check — does this Clerk user already have a saved profile?"""
+    """Lightweight check — does this Supabase user already have a saved profile?"""
     exists: bool
     is_onboarded: bool = False
 
@@ -431,7 +431,7 @@ class ComparisonCreate(BaseModel):
 
 class ComparisonRead(BaseModel):
     id: int
-    clerk_user_id: Optional[str] = None
+    supabase_user_id: Optional[str] = None
     amount: float
     from_currency: str
     to_currency: str
@@ -464,7 +464,7 @@ class RateAlertCreate(BaseModel):
 
 class RateAlertRead(BaseModel):
     id: int
-    clerk_user_id: str
+    supabase_user_id: str
     from_currency: str
     to_currency: str
     amount: float

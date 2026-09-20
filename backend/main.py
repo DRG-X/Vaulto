@@ -39,7 +39,7 @@ from providers import ALL_PROVIDERS
 
 import models
 from database import Base, engine, get_db
-from auth import verify_clerk_token, verify_admin_token
+from auth import verify_supabase_token, verify_admin_token
 from cache import get_cached_rates, set_cached_rates, init_cache, close_cache
 from scheduler import start_scheduler, stop_scheduler
 
@@ -161,11 +161,11 @@ async def health():
 
 @app.get("/user/status", response_model=UserStatusResponse)
 def get_user_status(
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     user = db.query(models.User).filter(
-        models.User.clerk_user_id == user_auth["clerk_user_id"]
+        models.User.supabase_user_id == user_auth["user_id"]
     ).first()
     return {
         "exists": user is not None,
@@ -175,11 +175,11 @@ def get_user_status(
 
 @app.get("/user/profile", response_model=ProfileResponse)
 def get_user_profile(
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     user = db.query(models.User).filter(
-        models.User.clerk_user_id == user_auth["clerk_user_id"]
+        models.User.supabase_user_id == user_auth["user_id"]
     ).first()
     if not user:
         raise HTTPException(status_code=404, detail="User profile not found")
@@ -189,16 +189,23 @@ def get_user_profile(
 @app.post("/user/profile", response_model=ProfileResponse, status_code=201)
 def create_user_profile(
     profile_data: ProfileCreate,
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
-    clerk_id = user_auth["clerk_user_id"]
-    existing = db.query(models.User).filter(models.User.clerk_user_id == clerk_id).first()
+    user_id = user_auth["user_id"]
+    existing = db.query(models.User).filter(
+        models.User.supabase_user_id == user_id
+    ).first()
     is_new_user = existing is None
 
     # A returning user re-posting their profile used to get their own stale row
     # back with nothing saved — the edit silently vanished. Write it either way.
-    user = upsert_user(db, clerk_id, email=user_auth.get("email"))
+    user = upsert_user(
+        db,
+        user_id,
+        email=user_auth.get("email"),
+        full_name=user_auth.get("full_name"),
+    )
     user.country         = profile_data.country
     user.university      = profile_data.university
     user.whatsapp_number = profile_data.whatsapp_number
@@ -209,7 +216,7 @@ def create_user_profile(
         db.refresh(user)
     except Exception:
         db.rollback()
-        logger.exception("Failed to save user profile for clerk_id=%s", clerk_id)
+        logger.exception("Failed to save user profile for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Database insertion failed")
 
     user.is_new_user = is_new_user
@@ -251,18 +258,21 @@ async def submit_contact(body: ContactMessage):
 
 users_router = APIRouter(prefix="/api/users", tags=["users"])
 
-def upsert_user(db: Session, clerk_id: str, email: Optional[str] = None,
+def upsert_user(db: Session, user_id: str, email: Optional[str] = None,
                 full_name: Optional[str] = None) -> models.User:
     """
-    Get-or-create the row for a Clerk user, and keep name/email current.
+    Get-or-create the row for a Supabase user, and keep name/email current.
 
     Sign-in fans out: post-auth syncs, and the dashboard syncs again as a
     safety net. Both can be in flight at once, so the INSERT can lose the race
-    against the unique index on `clerk_user_id`. Catching that and re-reading
+    against the unique index on `supabase_user_id`. Catching that and re-reading
     turns what used to be a 500 on the user's very first screen into the same
     row the other request just wrote.
+
+    An address that has since changed in Supabase is the one that can still
+    receive mail, so email overwrites rather than back-fills.
     """
-    user = db.query(models.User).filter(models.User.clerk_user_id == clerk_id).first()
+    user = db.query(models.User).filter(models.User.supabase_user_id == user_id).first()
     if user:
         changed = False
         if full_name and user.full_name != full_name:
@@ -277,7 +287,7 @@ def upsert_user(db: Session, clerk_id: str, email: Optional[str] = None,
         return user
 
     user = models.User(
-        clerk_user_id=clerk_id,
+        supabase_user_id=user_id,
         email=email,
         full_name=full_name,
         is_onboarded=False,
@@ -288,7 +298,9 @@ def upsert_user(db: Session, clerk_id: str, email: Optional[str] = None,
     except IntegrityError:
         # A concurrent sync inserted the same row first — adopt it.
         db.rollback()
-        existing = db.query(models.User).filter(models.User.clerk_user_id == clerk_id).first()
+        existing = db.query(models.User).filter(
+            models.User.supabase_user_id == user_id
+        ).first()
         if existing is None:
             raise
         return existing
@@ -297,39 +309,44 @@ def upsert_user(db: Session, clerk_id: str, email: Optional[str] = None,
 
 
 @users_router.post("/sync", response_model=UserRead)
-def sync_user(body: UserSync, user_auth: dict = Depends(verify_clerk_token), db: Session = Depends(get_db)):
+def sync_user(body: UserSync, user_auth: dict = Depends(verify_supabase_token), db: Session = Depends(get_db)):
     """
-    Called after Clerk sign-up/sign-in from post-auth.js.
+    Called after Supabase sign-up/sign-in from post-auth.js.
     Creates the user row if it doesn't exist, returns the user either way.
 
     The row is keyed off the verified token, not the body. A client that has
-    not yet hydrated its Clerk user object sends no id, and still syncs the
+    not yet hydrated its Supabase user object sends no id, and still syncs the
     account it is authenticated as; only an explicitly WRONG id is refused.
+
+    The token is the authority on email and name. The body is what the browser
+    believes, and a browser can be told anything; the claims were signed by
+    Supabase. Falling back to the body only covers the case where a custom
+    access-token hook has stripped a claim.
     """
-    clerk_id = user_auth["clerk_user_id"]
-    if body.clerk_id and body.clerk_id != clerk_id:
+    user_id = user_auth["user_id"]
+    if body.supabase_id and body.supabase_id != user_id:
         raise HTTPException(status_code=403, detail="Cannot sync another user's account")
 
     try:
         return upsert_user(
             db,
-            clerk_id,
-            email=body.email or user_auth.get("email"),
-            full_name=body.full_name,
+            user_id,
+            email=user_auth.get("email") or body.email,
+            full_name=user_auth.get("full_name") or body.full_name,
         )
     except Exception:
         db.rollback()
-        logger.exception("sync_user: failed for clerk_id=%s", clerk_id)
+        logger.exception("sync_user: failed for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Failed to sync user")
 
 
 @users_router.get("/me", response_model=UserRead)
 def get_me(
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     user = db.query(models.User).filter(
-        models.User.clerk_user_id == user_auth["clerk_user_id"]
+        models.User.supabase_user_id == user_auth["user_id"]
     ).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -339,11 +356,11 @@ def get_me(
 @users_router.patch("/me", response_model=UserRead)
 def update_me(
     body: UserUpdate,
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     user = db.query(models.User).filter(
-        models.User.clerk_user_id == user_auth["clerk_user_id"]
+        models.User.supabase_user_id == user_auth["user_id"]
     ).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -385,17 +402,22 @@ onboarding_router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
 @onboarding_router.post("/complete", response_model=UserRead)
 def complete_onboarding(
     body: OnboardingComplete,
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     """
     Saves all onboarding fields and marks onboarding_done = True.
     Called on final step submit of the onboarding wizard.
     """
-    clerk_id = user_auth["clerk_user_id"]
+    user_id = user_auth["user_id"]
     # Auto-creates the row if the sync call was missed, so onboarding can never
     # dead-end on "user not found" after the user has filled the whole wizard.
-    user = upsert_user(db, clerk_id, email=user_auth.get("email"))
+    user = upsert_user(
+        db,
+        user_id,
+        email=user_auth.get("email"),
+        full_name=user_auth.get("full_name"),
+    )
 
     user.country         = body.country
     user.university      = body.university
@@ -410,7 +432,7 @@ def complete_onboarding(
         db.refresh(user)
     except Exception:
         db.rollback()
-        logger.exception("complete_onboarding: failed for clerk_id=%s", clerk_id)
+        logger.exception("complete_onboarding: failed for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Failed to save onboarding data")
     return user
 
@@ -626,11 +648,11 @@ comparisons_router = APIRouter(prefix="/api/comparisons", tags=["comparisons"])
 @comparisons_router.post("", response_model=ComparisonRead, status_code=201)
 def save_comparison(
     body: ComparisonCreate,
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     record = models.Comparison(
-        clerk_user_id=user_auth["clerk_user_id"],
+        supabase_user_id=user_auth["user_id"],
         amount=body.amount,
         from_currency=body.from_currency.upper(),
         to_currency=body.to_currency.upper(),
@@ -650,13 +672,13 @@ def save_comparison(
 def list_comparisons(
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     offset = (page - 1) * limit
     rows = (
         db.query(models.Comparison)
-        .filter(models.Comparison.clerk_user_id == user_auth["clerk_user_id"])
+        .filter(models.Comparison.supabase_user_id == user_auth["user_id"])
         .order_by(models.Comparison.created_at.desc())
         .offset(offset)
         .limit(limit)
@@ -678,7 +700,7 @@ alerts_router = APIRouter(prefix="/api/alerts", tags=["alerts"])
 @alerts_router.post("", response_model=RateAlertRead, status_code=201)
 def create_alert(
     body: RateAlertCreate,
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     # WhatsApp is offered by the model and the UI but nothing delivers it, so
@@ -692,7 +714,7 @@ def create_alert(
         )
 
     alert = models.RateAlert(
-        clerk_user_id   = user_auth["clerk_user_id"],
+        supabase_user_id = user_auth["user_id"],
         from_currency   = body.from_currency.upper(),
         to_currency     = body.to_currency.upper(),
         amount          = body.amount,
@@ -714,12 +736,12 @@ def create_alert(
 
 @alerts_router.get("", response_model=list[RateAlertRead])
 def list_alerts(
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     return (
         db.query(models.RateAlert)
-        .filter(models.RateAlert.clerk_user_id == user_auth["clerk_user_id"])
+        .filter(models.RateAlert.supabase_user_id == user_auth["user_id"])
         .order_by(models.RateAlert.created_at.desc())
         .all()
     )
@@ -729,12 +751,12 @@ def list_alerts(
 def update_alert(
     alert_id: int,
     body: RateAlertUpdate,
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     alert = db.query(models.RateAlert).filter(
         models.RateAlert.id == alert_id,
-        models.RateAlert.clerk_user_id == user_auth["clerk_user_id"]
+        models.RateAlert.supabase_user_id == user_auth["user_id"]
     ).first()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -764,12 +786,12 @@ def update_alert(
 @alerts_router.delete("/{alert_id}", status_code=204)
 def delete_alert(
     alert_id: int,
-    user_auth: dict = Depends(verify_clerk_token),
+    user_auth: dict = Depends(verify_supabase_token),
     db: Session = Depends(get_db)
 ):
     alert = db.query(models.RateAlert).filter(
         models.RateAlert.id == alert_id,
-        models.RateAlert.clerk_user_id == user_auth["clerk_user_id"]
+        models.RateAlert.supabase_user_id == user_auth["user_id"]
     ).first()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -801,19 +823,19 @@ async def track_click(
 ):
     """
     Fire-and-forget click event from the results page.
-    Authenticated users get their clerk_user_id attached; anonymous clicks are
-    stored with clerk_user_id=None — both are valid for revenue analytics.
+    Authenticated users get their supabase_user_id attached; anonymous clicks
+    are stored with supabase_user_id=None — both are valid for revenue analytics.
     """
-    clerk_user_id = None
+    supabase_user_id = None
     if credentials:
         try:
-            payload = verify_clerk_token(credentials)
-            clerk_user_id = payload.get("clerk_user_id")
+            payload = verify_supabase_token(credentials)
+            supabase_user_id = payload.get("user_id")
         except Exception:
             pass  # anonymous click — perfectly fine
 
     click = models.ProviderClick(
-        clerk_user_id=clerk_user_id,
+        supabase_user_id=supabase_user_id,
         provider=body.provider,
         from_currency=body.from_currency.upper(),
         to_currency=body.to_currency.upper(),

@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/router";
-import { useAuth, useUser } from "@clerk/nextjs";
+import { useAuth, useUser } from "../contexts/AuthContext";
 import Head from "next/head";
 import { syncUser, checkUserStatus } from "../lib/api";
 import { redirectFromQuery, withRedirect } from "../lib/redirect";
 
-/** Clerk needs a tick or two after an OAuth redirect before a token exists. */
+/**
+ * Supabase needs a tick or two after an OAuth redirect before a token exists:
+ * /sso-callback exchanges the code, and the session cookie it writes has to
+ * reach this page before getToken() can return anything.
+ */
 async function tokenWithRetry(getToken, attempts = 4) {
   for (let i = 0; i < attempts; i++) {
     try {
@@ -52,7 +56,7 @@ export default function PostAuth() {
     if (!isLoaded || !userLoaded) return;
     if (!isSignedIn) { router.replace("/auth"); return; }
     // Wait for the user object: syncing with a half-hydrated id used to send
-    // an empty clerk_id and get a 403 back.
+    // an empty supabase_id and get a 403 back.
     if (!user?.id) return;
     if (ran.current) return;
     ran.current = true;
@@ -69,10 +73,13 @@ export default function PostAuth() {
           return;
         }
 
+        // The backend re-reads all three from the verified token; sending
+        // them only covers a project with a custom claims hook that strips
+        // them.
         await withRetry(() => syncUser(token, {
-          clerk_id:  user.id,
-          email:     user.primaryEmailAddress?.emailAddress || "",
-          full_name: user.fullName || user.username || "",
+          supabase_id: user.id,
+          email:       user.email || "",
+          full_name:   user.fullName || "",
         }));
         if (cancelled) return;
 

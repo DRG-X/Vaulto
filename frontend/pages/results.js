@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useRouter } from "next/router";
-import { useAuth } from "@clerk/nextjs";
+import { useAuth } from "../contexts/AuthContext";
 import Head from "next/head";
 import Link from "next/link";
 import Nav from "../components/Nav";

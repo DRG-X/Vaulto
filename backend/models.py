@@ -7,7 +7,10 @@ class User(Base):
     __tablename__ = "users"
 
     id              = Column(Integer, primary_key=True, index=True)
-    clerk_user_id   = Column(String, unique=True, index=True, nullable=False)  # Clerk's user_id
+    # The UUID of the row in Supabase's `auth.users`, i.e. the `sub` claim of
+    # the access token. Stored as text rather than a Postgres UUID so the
+    # same models run against SQLite in local development and in the tests.
+    supabase_user_id = Column(String, unique=True, index=True, nullable=False)
     email           = Column(String, index=True, nullable=True)
     full_name       = Column(String, nullable=True)
     # Where the user SENDS FROM — the country they live or study in, and the
@@ -27,7 +30,7 @@ class Comparison(Base):
     __tablename__ = "comparisons"
 
     id            = Column(Integer, primary_key=True, index=True)
-    clerk_user_id = Column(String, ForeignKey("users.clerk_user_id", ondelete="CASCADE"), nullable=True)
+    supabase_user_id = Column(String, ForeignKey("users.supabase_user_id", ondelete="CASCADE"), nullable=True)
     amount        = Column(Float, nullable=False)
     from_currency = Column(String, nullable=False)
     to_currency   = Column(String, nullable=False)
@@ -39,7 +42,7 @@ class RateAlert(Base):
     __tablename__ = "rate_alerts"
 
     id              = Column(Integer, primary_key=True, index=True)
-    clerk_user_id   = Column(String, ForeignKey("users.clerk_user_id", ondelete="CASCADE"), nullable=False)
+    supabase_user_id = Column(String, ForeignKey("users.supabase_user_id", ondelete="CASCADE"), nullable=False)
     from_currency   = Column(String, nullable=False)
     to_currency     = Column(String, nullable=False)
     amount          = Column(Float, nullable=False)
@@ -59,7 +62,7 @@ class ProviderClick(Base):
     __tablename__ = "provider_clicks"
 
     id            = Column(Integer, primary_key=True, index=True)
-    clerk_user_id = Column(String, nullable=True)          # null = anonymous visitor
+    supabase_user_id = Column(String, nullable=True)       # null = anonymous visitor
     provider      = Column(String, nullable=False, index=True)
     from_currency = Column(String, nullable=False)
     to_currency   = Column(String, nullable=False)

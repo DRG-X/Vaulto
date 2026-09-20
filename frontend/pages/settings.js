@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/router";
-import { useAuth, useUser } from "@clerk/nextjs";
+import { useAuth, useUser, useSupabase } from "../contexts/AuthContext";
 import Head from "next/head";
 import Link from "next/link";
 import Nav from "../components/Nav";
@@ -19,6 +19,8 @@ export default function Settings() {
   const router = useRouter();
   const { isLoaded, isSignedIn, getToken } = useAuth();
   const { user } = useUser();
+  const supabase = useSupabase();
+  const [pwStatus, setPwStatus] = useState("");
 
   const [section, setSection] = useState("profile");
   const [profile, setProfile] = useState(null);
@@ -78,9 +80,27 @@ export default function Settings() {
     }
   };
 
-  const initials = user?.firstName
-    ? `${user.firstName[0]}${user.lastName?.[0] || ""}`.toUpperCase()
-    : "?";
+  /**
+   * Send a password-reset link rather than taking a new password inline.
+   *
+   * A signed-in session is enough for supabase.auth.updateUser({ password }),
+   * but that means an unattended laptop is enough to lock someone out of their
+   * own account. Mailing the link puts the change behind the inbox.
+   */
+  const handlePasswordReset = async () => {
+    if (!user?.email) return;
+    setPwStatus("Sending…");
+    const { error: resetError } = await supabase.auth.resetPasswordForEmail(user.email, {
+      redirectTo: `${window.location.origin}/reset-password`,
+    });
+    setPwStatus(
+      resetError
+        ? (resetError.message || "Could not send the reset email.")
+        : `Sent — check ${user.email} for the link.`
+    );
+  };
+
+  const initials = user?.initials || "?";
 
   return (
     <>
@@ -126,7 +146,7 @@ export default function Settings() {
                     <div className="big-avatar">{initials}</div>
                     <div>
                       <p style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.1rem" }}>{user?.fullName || fullName}</p>
-                      <p style={{ color: "var(--muted)", fontSize: "0.875rem" }}>{user?.primaryEmailAddress?.emailAddress}</p>
+                      <p style={{ color: "var(--muted)", fontSize: "0.875rem" }}>{user?.email}</p>
                     </div>
                   </div>
                   <div className="settings-form">
@@ -135,8 +155,8 @@ export default function Settings() {
                       <input id="pf-name" type="text" value={fullName} onChange={e => setFullName(e.target.value)} />
                     </div>
                     <div className="field">
-                      <label htmlFor="pf-email">Email (from Clerk)</label>
-                      <input id="pf-email" type="email" value={user?.primaryEmailAddress?.emailAddress || ""} disabled style={{ opacity: 0.6 }} />
+                      <label htmlFor="pf-email">Email (from your Supabase account)</label>
+                      <input id="pf-email" type="email" value={user?.email || ""} disabled style={{ opacity: 0.6 }} />
                     </div>
                     <div className="field">
                       <label htmlFor="pf-whatsapp">WhatsApp number</label>
@@ -232,16 +252,20 @@ export default function Settings() {
               <div className="security-item">
                 <div>
                   <p style={{ fontWeight: 600 }}>Password</p>
-                  <p style={{ fontSize: "0.85rem", color: "var(--muted)" }}>Managed by Clerk secure authentication</p>
+                  <p style={{ fontSize: "0.85rem", color: "var(--muted)" }}>
+                    {pwStatus || "We'll email you a link to set a new one."}
+                  </p>
                 </div>
-                <span className="pill pill-tertiary">✓ Secure</span>
+                <button className="btn-ghost" id="change-password" onClick={handlePasswordReset}>
+                  Change password
+                </button>
               </div>
               <div className="security-item">
                 <div>
                   <p style={{ fontWeight: 600 }}>Two-factor authentication</p>
                   <p style={{ fontSize: "0.85rem", color: "var(--muted)" }}>Add an extra layer of security to your account</p>
                 </div>
-                <span className="pill pill-muted">Via Clerk dashboard</span>
+                <span className="pill pill-muted">Coming soon</span>
               </div>
               <div className="security-item">
                 <div>
