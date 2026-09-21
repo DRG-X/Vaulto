@@ -254,3 +254,55 @@ async def set_cached_rates(
         logger.error("CACHE STEP: ❌ Cache WRITE FAILED (key=%s): %s", key, exc)
     except Exception as exc:
         logger.error("CACHE STEP: ❌ Cache WRITE unexpected error (key=%s): %s", key, exc)
+
+# ---------------------------------------------------------------------------
+# Single-flight lock
+# ---------------------------------------------------------------------------
+
+async def try_acquire_lock(name: str, ttl_seconds: int) -> bool:
+    """
+    Claim a named lock across every instance, or report that someone else has it.
+
+    Cloud Run routes each request to whichever instance has capacity, so two
+    overlapping alert ticks can land on two different instances — and a
+    process-local lock cannot see that. `SET key value NX EX ttl` is one atomic
+    round trip that only one caller can win, which is exactly the guarantee
+    needed.
+
+    Returns False when Redis holds the lock. Returns **True** when Redis is not
+    configured or unreachable: this is a guard against a rare overlap, not a
+    correctness requirement, and refusing to run the alert check because the
+    optional cache is down would turn a small risk of a duplicate email into a
+    certainty of no alerts at all. The caller still has its in-process lock.
+
+    The TTL is what makes this safe to leave behind: an instance killed
+    mid-run cannot hold the lock for longer than that.
+    """
+    if _client is None:
+        return True
+    try:
+        acquired = await _client.set(f"lock:{name}", "held", nx=True, ex=ttl_seconds)
+        if not acquired:
+            logger.info("LOCK: %s is already held by another run", name)
+        return bool(acquired)
+    except RedisError as exc:
+        logger.warning("LOCK: could not reach Redis to claim %s (%s) — proceeding", name, exc)
+        return True
+    except Exception as exc:
+        logger.warning("LOCK: unexpected error claiming %s (%s) — proceeding", name, exc)
+        return True
+
+
+async def release_lock(name: str) -> None:
+    """
+    Hand a lock back early, so the next tick is not made to wait out the TTL.
+
+    Failure is only logged: the TTL expiring is the backstop, so a lock that
+    cannot be deleted costs one skipped run at worst.
+    """
+    if _client is None:
+        return
+    try:
+        await _client.delete(f"lock:{name}")
+    except Exception as exc:
+        logger.warning("LOCK: could not release %s (%s) — it will expire on its own", name, exc)

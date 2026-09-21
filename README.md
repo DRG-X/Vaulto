@@ -5,9 +5,9 @@ Flint is a real-time comparison tool that fetches live quotes from **Wise**, **R
 **Deploying?** Start with **[DEPLOYMENT.md](DEPLOYMENT.md)** for the ordered
 steps, and **[ENVIRONMENT.md](ENVIRONMENT.md)** for every environment variable
 and where in each dashboard to find it. Short version: frontend on Vercel,
-database and auth on Supabase, and the FastAPI backend on a container host
-(Render / Railway / Fly) because its alert scheduler needs a process that stays
-alive.
+database and auth on Supabase, and the FastAPI backend on Google Cloud Run. The
+15-minute rate-alert tick is a Supabase Cron job calling a protected endpoint on
+that service, so it keeps working while Cloud Run is scaled to zero.
 
 ---
 
@@ -572,10 +572,16 @@ Full walkthrough: **[DEPLOYMENT.md](DEPLOYMENT.md)**. Every environment
 variable, and where to get it: **[ENVIRONMENT.md](ENVIRONMENT.md)**. What
 follows is the shape of it.
 
-The backend does **not** go on Vercel. Its rate-alert checker is an in-process
-scheduler that has to be alive between 15-minute ticks, it migrates the database
-at startup, and one comparison fans out to 28 provider APIs — none of which
-survives a serverless function that is frozen between requests.
+The backend does **not** go on Vercel: it migrates the database at startup and
+one comparison fans out to 28 provider APIs with a 15-second timeout each, which
+does not fit a Vercel function.
+
+There is no scheduler inside the API process. That used to be an APScheduler job
+ticking every 15 minutes, which silently stopped delivering alerts the moment the
+service could scale to zero — no process, no ticks. The schedule now lives in
+Postgres: `pg_cron` posts to `/internal/check-alerts` every 15 minutes, bearing a
+shared secret, and that request is also what wakes an idle instance. The alert
+logic is unchanged; only its trigger moved.
 
 ### Database + auth (Supabase)
 
@@ -583,12 +589,19 @@ Managed — nothing to deploy. Point the backend at the project and it migrates
 itself on startup, Row Level Security included. See
 [Supabase (database + auth)](#supabase-database--auth).
 
-### Backend (Render / Fly.io / Railway / anywhere that runs a container)
+### Backend (Google Cloud Run)
+
+Built from `backend/Dockerfile`, deployed straight from source:
 
 ```bash
-# Procfile
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
+gcloud run deploy vaulto-api --source backend --region asia-south1 \
+  --allow-unauthenticated --timeout 600 --min-instances 0
 ```
+
+`--allow-unauthenticated` is required rather than careless: the cron caller is a
+`pg_net` request from inside Postgres, which cannot mint the Google OIDC token
+IAM authentication needs. `/internal/check-alerts` carries its own door instead —
+`CRON_SECRET`, compared in constant time, failing closed.
 
 Required environment:
 
@@ -596,13 +609,21 @@ Required environment:
 DATABASE_URL=postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres
 DIRECT_URL=postgresql://postgres.PROJECT_REF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
 SUPABASE_URL=https://your-project-ref.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=<service_role key>
+SUPABASE_SERVICE_ROLE_KEY=<service_role key>     # via Secret Manager
 ALLOWED_ORIGINS=https://your-frontend.vercel.app
 ADMIN_USER_IDS=<comma-separated Supabase user UUIDs>
+CRON_SECRET=<openssl rand -hex 32>               # via Secret Manager
 ```
 
 Add `SUPABASE_JWT_SECRET` only if the project still signs tokens with the
 legacy shared secret.
+
+### The alert tick (Supabase Cron)
+
+Run `supabase/cron_check_alerts.sql` once, with your Cloud Run URL and the same
+`CRON_SECRET` filled in. It enables `pg_cron` and `pg_net`, keeps the secret in
+Vault rather than in the job body, and schedules `*/15 * * * *`. **Skip this and
+rate alerts are never checked, with nothing to report that.**
 
 ### Frontend (Vercel)
 

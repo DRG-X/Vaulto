@@ -1,7 +1,21 @@
+"""
+scheduler.py — the rate-alert check, and everything it takes to deliver one.
+
+The name is historical: there is no scheduler in here any more. This module used
+to own an APScheduler job that ticked every 15 minutes inside the API process,
+which required a process that stays alive between ticks. On Cloud Run, which
+scales to zero when no request is in flight, that process does not exist — the
+ticks simply never happened and alerts silently stopped being delivered.
+
+`check_alerts()` is now driven from outside, by Supabase Cron calling
+`POST /internal/check-alerts` every 15 minutes (see main.py). The schedule lives
+in the database, where it survives a deployment that has no instances running,
+and the work itself is unchanged.
+"""
+
 import logging
 import datetime
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.orm import Session
 
 import notifications
@@ -13,7 +27,6 @@ from cache import get_cached_rates, set_cached_rates
 from money import D
 
 logger = logging.getLogger(__name__)
-scheduler = AsyncIOScheduler()
 
 
 def _quote_for_alert(pools, alert: RateAlert):
@@ -56,7 +69,13 @@ def _quote_for_alert(pools, alert: RateAlert):
 
 
 async def check_alerts():
-    """Run every 15 minutes. Check all active alerts against live rates."""
+    """
+    Check every active alert against live rates, and deliver the ones that hit.
+
+    Called once per tick by `POST /internal/check-alerts`, which Supabase Cron
+    requests every 15 minutes. It opens and closes its own database session, so
+    it is safe to call from a request handler.
+    """
     logger.info("Alert checker: starting run")
     db: Session = SessionLocal()
     try:
@@ -258,23 +277,3 @@ async def send_alert_notification(
 
     logger.info("Alert %s delivered to %s", alert.id, address)
     return True
-
-
-def start_scheduler() -> None:
-    """Register the alert-checker job and start the scheduler."""
-    scheduler.add_job(
-        check_alerts,
-        trigger="interval",
-        minutes=15,
-        id="alert_checker",
-        replace_existing=True,
-    )
-    scheduler.start()
-    logger.info("Alert scheduler started — checking every 15 minutes")
-
-
-def stop_scheduler() -> None:
-    """Gracefully shut down the scheduler (called on app shutdown)."""
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-        logger.info("Alert scheduler stopped")

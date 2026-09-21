@@ -1,15 +1,17 @@
-# Vaulto API — FastAPI + APScheduler.
+# Vaulto API — FastAPI on Google Cloud Run.
 #
-# This runs as a LONG-LIVED container, not a serverless function. The alert
-# checker is an in-process scheduler that has to be alive between its 15-minute
-# ticks, startup migrates the database, and a comparison fans out to 28 provider
-# APIs with a 15-second timeout each. None of those survive a function that is
-# frozen between requests, which is why the backend does not go on Vercel.
+# Cloud Run scales to zero, which is why there is no in-process scheduler in this
+# service any more. The rate-alert check is an endpoint
+# (POST /internal/check-alerts) that Supabase Cron requests every 15 minutes; the
+# schedule lives in Postgres, where it survives having no instances running.
+#
+# Because nothing in here is stateful between requests, Cloud Run may run as many
+# instances of this image as it likes.
 
 FROM python:3.11-slim
 
-# Unbuffered so logs reach the platform's log viewer as they happen rather than
-# when the buffer fills — the difference between watching a deploy and guessing.
+# Unbuffered so logs reach Cloud Logging as they happen rather than when the
+# buffer fills — the difference between watching a deploy and guessing.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
@@ -17,9 +19,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # psycopg2-binary ships its own libpq, so only the runtime TLS libraries are
-# needed here; curl is for the container healthcheck below.
+# needed here.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 # Dependencies first: this layer is cached and only rebuilds when the
@@ -33,14 +35,16 @@ COPY . .
 RUN useradd --create-home --uid 10001 vaulto && chown -R vaulto:vaulto /app
 USER vaulto
 
-# $PORT is injected by Render, Railway and Fly; 8000 is the local default.
-ENV PORT=8000
-EXPOSE 8000
+# Cloud Run injects PORT and expects the container to listen on it. 8080 is its
+# default and the value to assume when testing the image locally.
+ENV PORT=8080
+EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-  CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
-
-# One worker on purpose: a second worker would start a SECOND copy of the alert
-# scheduler, and both would fire the same alert. Scale with instances behind a
-# load balancer only once the scheduler has been moved out of the web process.
+# One uvicorn worker. Cloud Run scales by adding INSTANCES, not by asking one
+# container to fork; a second worker would just contend for the same CPU
+# allocation and double the database connections each instance opens.
+#
+# --proxy-headers with a trusted wildcard: Cloud Run terminates TLS at its front
+# end and passes the real client IP in X-Forwarded-For, which is what the rate
+# limiter keys on. Traffic cannot reach the container except through that proxy.
 CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]

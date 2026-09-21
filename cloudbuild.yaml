@@ -1,0 +1,54 @@
+# Cloud Build → Artifact Registry → Cloud Run, for the Vaulto API.
+#
+# Connect this with a Cloud Build trigger (Cloud Build → Triggers → Create, on
+# push to your branch) and every push deploys. The frontend is NOT here: it is on
+# Vercel, which builds it from the same repository.
+#
+# Nothing secret appears in this file. Environment variables are set once on the
+# service with `gcloud run services update` (see DEPLOYMENT.md) and are left
+# alone by these deploys, and CRON_SECRET comes from Secret Manager.
+
+substitutions:
+  _SERVICE: vaulto-api
+  _REGION: asia-south1          # Mumbai — put this near your Supabase region
+  _REPO: vaulto                 # Artifact Registry repository
+
+images:
+  - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${SHORT_SHA}'
+
+steps:
+  # Build. --cache-from lets an unchanged requirements.txt reuse the dependency
+  # layer, which is most of the build time.
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        docker pull "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:latest" || true
+        docker build \
+          --cache-from "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:latest" \
+          -t "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${SHORT_SHA}" \
+          -t "${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:latest" \
+          -f backend/Dockerfile backend
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '--all-tags', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}']
+
+  # Deploy. Only the image changes here — env vars, secrets, scaling and timeout
+  # stay as they were configured on the service, so a deploy cannot silently drop
+  # a variable that was added by hand.
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - '${_SERVICE}'
+      - '--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_SERVICE}:${SHORT_SHA}'
+      - '--region=${_REGION}'
+      - '--platform=managed'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

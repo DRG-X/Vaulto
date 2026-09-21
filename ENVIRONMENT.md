@@ -6,7 +6,7 @@ the frontend file publishes it to every visitor.
 | | file | goes to |
 |---|---|---|
 | **Frontend** | `frontend/.env.local` | Vercel → Project → Settings → Environment Variables |
-| **Backend** | `backend/.env` | your backend host's environment settings (Render / Railway / Fly) |
+| **Backend** | `backend/.env` | the Cloud Run service's environment variables |
 
 Templates to copy: `frontend/.env.example` and `backend/.env.example`.
 Both `.env` files are gitignored. Keep it that way — if a key ever lands in a
@@ -50,10 +50,14 @@ entirely, and in this file it would be handed to every visitor.
 
 ### `NEXT_PUBLIC_API_URL`
 The public URL of your deployed backend, e.g.
-`https://vaulto-api.onrender.com`. No trailing slash.
+`https://vaulto-api-abc123-uc.a.run.app`. No trailing slash.
 
-> You get this **after** deploying the backend (step 3 of DEPLOYMENT.md). On
-> Render it is shown at the top of the service page.
+> You get this **after** deploying the backend (step 3 of DEPLOYMENT.md).
+> `gcloud run deploy` prints it, and it is also on the Cloud Run service page.
+> To fetch it again:
+> ```
+> gcloud run services describe vaulto-api --region REGION --format='value(status.url)'
+> ```
 
 Must be `https://` in production: an HTTPS page is not permitted to call an
 HTTP address, and the browser blocks it as mixed content. `next build` refuses
@@ -142,6 +146,49 @@ it shows a *signing key* with an algorithm like ES256/RS256, leave
 `SUPABASE_JWT_SECRET` blank. If it shows only a *JWT secret*, set it. Setting
 it when it is not needed is harmless; the token's own `alg` header decides which
 path is used, so both work at once during a rotation.
+
+### `CRON_SECRET`  — **required, or rate alerts never fire**
+
+A long random string, shared between the Cloud Run service and Supabase. It is
+the only thing standing in front of `POST /internal/check-alerts`, the endpoint
+Supabase Cron calls every 15 minutes to run the rate-alert check.
+
+> Nobody issues this to you — you generate it:
+> ```
+> openssl rand -hex 32
+> ```
+> The same value goes in **two** places: `CRON_SECRET` on the Cloud Run service
+> (via Secret Manager — see DEPLOYMENT.md step 3) and Supabase Vault under the
+> name `vaulto_cron_secret` (see `supabase/cron_check_alerts.sql`).
+
+**Why a shared secret and not Google IAM.** Cloud Run can demand a Google-signed
+OIDC token, which is stronger. The caller here is a `pg_cron` job making an HTTP
+request from inside Postgres through `pg_net`; it has no Google service account
+and cannot mint that token. An IAM-protected service would be unreachable from
+it. So the service is deployed `--allow-unauthenticated` and this endpoint
+carries its own door.
+
+That makes the secret the whole of the protection, so:
+
+- Generate it randomly. Do not reuse a password or any other key.
+- Never commit it. It belongs in Secret Manager and Vault, both of which keep it
+  out of the deploy config and out of `cron.job`'s readable SQL body.
+- 32 characters minimum. The service logs a warning below that but refuses
+  nothing — a weak secret is better than no alerts.
+
+**It fails closed.** With `CRON_SECRET` unset the endpoint answers `503` to
+everyone, including you, rather than running for anyone who asks. If alerts are
+not arriving, that is the first thing to check:
+
+```
+curl -i -X POST https://YOUR-SERVICE.a.run.app/internal/check-alerts
+```
+
+`401` means the endpoint is armed and your request lacked the secret — the
+healthy answer to that command. `503` means the service has no secret set.
+
+**Rotating it:** update Vault and Cloud Run in the same sitting. A tick that
+lands between the two gets a `401` and costs one 15-minute cycle.
 
 ---
 
@@ -233,7 +280,8 @@ Niyo and TorFX publish no documented endpoint, so their `_API_URL` is required
 alongside the key — the URL comes from your partner agreement.
 
 ### `PORT`
-Set by Render / Railway / Fly automatically. **Do not set it yourself.**
+Injected by Cloud Run (it uses 8080). **Do not set it yourself** — Cloud Run
+rejects a service that tries to.
 
 ---
 
@@ -249,7 +297,8 @@ NEXT_PUBLIC_API_URL=https://<your-backend-host>
 NEXT_PUBLIC_ADMIN_USER_IDS=<your user UUID>
 ```
 
-**Backend host** → Environment:
+**Cloud Run service** → Variables & Secrets (or the `gcloud run deploy` command
+in DEPLOYMENT.md step 3):
 
 ```
 DATABASE_URL=postgresql://postgres.YOURREF:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres
@@ -258,12 +307,21 @@ SUPABASE_URL=https://YOURREF.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=<service_role / secret key>
 ADMIN_USER_IDS=<your user UUID>
 ALLOWED_ORIGINS=https://your-app.vercel.app
+CRON_SECRET=<openssl rand -hex 32>          # also into Supabase Vault
 # optional
 REDIS_URL=rediss://default:PASSWORD@HOST:6379
 RESEND_API_KEY=re_...
 ALERT_FROM_EMAIL=Vaulto Alerts <alerts@yourdomain.com>
 SUPABASE_JWT_SECRET=<only if your project has no JWT signing keys>
 ```
+
+`CRON_SECRET` and `SUPABASE_SERVICE_ROLE_KEY` are the two that should go through
+**Secret Manager** rather than plain environment variables, so they are not
+readable from the service's deploy config.
+
+**Supabase** → SQL Editor, once: run `supabase/cron_check_alerts.sql` with your
+Cloud Run URL and the same `CRON_SECRET` filled in. Without it the rate-alert
+check is never triggered and nothing tells you so.
 
 ## 6. When something is wrong
 
@@ -276,4 +334,7 @@ SUPABASE_JWT_SECRET=<only if your project has no JWT signing keys>
 | Backend won't start, "could not translate host name" | Password not percent-encoded in `DATABASE_URL`, or `[YOUR-PASSWORD]` never replaced |
 | Sign-up email link goes to `localhost:3000` | Supabase **Authentication → URL Configuration → Site URL** still points at localhost |
 | Logs say "caching disabled" | `REDIS_URL` unset, or you set the Upstash **REST** pair instead |
-| Alerts never arrive | No `RESEND_API_KEY`, unverified sender domain, or the backend is on a free tier that sleeps |
+| Alerts never arrive | Work down this list: (1) the Supabase Cron job was never created — `select * from cron.job`; (2) `CRON_SECRET` mismatched between Vault and Cloud Run — look for `401` in `net._http_response`; (3) no `RESEND_API_KEY`; (4) unverified Resend sender domain |
+| `503` from `/internal/check-alerts` | `CRON_SECRET` is not set on the Cloud Run service |
+| `409` from `/internal/check-alerts` | A previous run is still going. Harmless once; if it repeats every tick, a run is taking over 15 minutes |
+| Cron rows in `net._http_response` are empty or errored | pg_net stopped waiting before the run finished. Raise `timeout_milliseconds`; the run itself still completed |

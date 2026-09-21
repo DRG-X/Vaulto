@@ -6,12 +6,16 @@ pydantic==2.7.1
 sqlalchemy==2.0.30
 PyJWT[crypto]==2.8.0
 python-dotenv==1.0.1
-alembic==1.13.1               # runtime: startup runs `upgrade head` (see main.run_migrations)
+alembic==1.13.1               # runtime: startup runs `upgrade head` (see main.init_schema)
 psycopg2-binary==2.9.9
 redis==5.0.3
 hiredis==2.3.2
 slowapi==0.1.9
-APScheduler==3.10.4
 # Email (rate alerts) goes through Resend's REST API over httpx — see
 # notifications.py. The `resend` SDK is deliberately NOT used: its send is
-# a blocking call, and the alert checker shares the API server's event loop.
+# a blocking call, and the alert check runs on the API server's event loop.
+#
+# APScheduler used to be here, for an in-process job that ticked every 15
+# minutes. It is gone: Cloud Run scales to zero, so there was no process to tick
+# and alerts silently stopped. The schedule lives in Supabase (pg_cron) and
+# arrives as a request to /internal/check-alerts.

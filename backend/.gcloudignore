@@ -1,0 +1,16 @@
+# Mirrors .dockerignore — `gcloud run deploy --source` uploads this directory to
+# Cloud Build, so anything excluded here never leaves the machine.
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite3
+tests/
+requirements-dev.txt

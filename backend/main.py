@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import re
 import sys
 import os
+import time
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 
@@ -41,8 +43,12 @@ from providers import ALL_PROVIDERS
 import models
 from database import Base, engine, get_db
 from auth import verify_supabase_token, verify_admin_token
-from cache import get_cached_rates, set_cached_rates, init_cache, close_cache
-from scheduler import start_scheduler, stop_scheduler
+from cache import (
+    get_cached_rates, set_cached_rates, init_cache, close_cache,
+    try_acquire_lock, release_lock,
+)
+from cron_auth import verify_cron_secret
+from scheduler import check_alerts
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -149,9 +155,10 @@ async def lifespan(app: FastAPI):
     from models import User, Comparison, RateAlert, ProviderClick  # noqa — ensures models registered
     init_schema()        # migrate to head, then create_all as a safety net
     logger.info("CORS allowed origins: %s (regex=%s)", ALLOWED_ORIGINS, ALLOWED_ORIGIN_REGEX)
-    start_scheduler()    # background alert checker — every 15 min
+    # Nothing schedules the alert check from in here. It is driven by Supabase
+    # Cron calling POST /internal/check-alerts, because this process does not
+    # exist between requests on Cloud Run — see the endpoint below.
     yield
-    stop_scheduler()     # graceful shutdown
     await close_cache()  # graceful shutdown
 
 
@@ -913,6 +920,88 @@ async def track_click(
 
 
 app.include_router(clicks_router)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# /internal  — machine-to-machine, no user session
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: Kept out of the public OpenAPI schema. /docs is reachable by anyone, and an
+#: endpoint that starts work has no business being advertised there. This is
+#: tidiness, not security — the secret is what protects it.
+internal_router = APIRouter(prefix="/internal", tags=["internal"], include_in_schema=False)
+
+#: Name of the cross-instance lock. Distinct from the cache's `rates:` keys.
+ALERT_RUN_LOCK = "alert-check"
+
+#: How long the lock survives without being released. Long enough that a slow
+#: run is not lapped by the next tick, short enough that an instance killed
+#: mid-run does not block alerts for long. The cron fires every 15 minutes.
+ALERT_RUN_LOCK_TTL = 14 * 60
+
+#: Guards against two ticks overlapping ON THIS INSTANCE. The Redis lock above
+#: is what covers two different instances; this one costs nothing and works even
+#: when Redis is not configured.
+_alert_run_lock = asyncio.Lock()
+
+
+@internal_router.post("/check-alerts")
+async def run_alert_check(_: None = Depends(verify_cron_secret)):
+    """
+    Run one pass of the rate-alert checker. Called by Supabase Cron.
+
+    Why this exists as an HTTP endpoint at all: the check used to be an
+    APScheduler job inside this process, and Cloud Run scales to zero, so
+    between requests there was no process to tick. The schedule now lives in
+    Postgres — `cron.schedule` in Supabase — and arrives here as a request,
+    which is the one thing that reliably wakes a scaled-to-zero service.
+
+    It runs the work SYNCHRONOUSLY and answers when the pass is done. That is
+    deliberate: Cloud Run throttles an instance's CPU once it has responded, so
+    answering early and finishing in the background is how you get a run that is
+    silently cut off partway through. A caller that gives up waiting is the
+    lesser problem — the run continues and the next tick is 15 minutes away.
+
+    The alert logic itself is untouched; this only decides when it runs and that
+    it runs once at a time.
+    """
+    # A tick arriving while the last one is still going would re-read the same
+    # active alerts and could deliver the same email twice, since an alert is
+    # only paused once its notification is confirmed sent. Both locks are
+    # skipped over rather than queued: the work is already being done.
+    if _alert_run_lock.locked():
+        logger.warning("Alert check already running on this instance — skipping this tick")
+        raise HTTPException(
+            status_code=409,
+            detail="An alert check is already running. Skipped this tick.",
+        )
+
+    async with _alert_run_lock:
+        if not await try_acquire_lock(ALERT_RUN_LOCK, ALERT_RUN_LOCK_TTL):
+            logger.warning("Alert check already running on another instance — skipping this tick")
+            raise HTTPException(
+                status_code=409,
+                detail="An alert check is already running elsewhere. Skipped this tick.",
+            )
+
+        started = time.monotonic()
+        try:
+            await check_alerts()
+        except Exception:
+            # Answer with a 500 so the failure shows up in Supabase's
+            # cron.job_run_details instead of looking like a successful tick.
+            logger.exception("Alert check failed")
+            raise HTTPException(status_code=500, detail="The alert check failed. See logs.")
+        finally:
+            await release_lock(ALERT_RUN_LOCK)
+
+        elapsed = round(time.monotonic() - started, 2)
+
+    logger.info("Alert check completed in %.2fs", elapsed)
+    return {"status": "completed", "duration_seconds": elapsed}
+
+
+app.include_router(internal_router)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
